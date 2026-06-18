@@ -4,7 +4,7 @@ set -u
 
 APP_NAME="Mihomo-lite"
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -982,12 +982,12 @@ uninstall_all() {
 
 menu() {
   # 利用 printf 定义终端颜色，确保跨平台与 cat <<EOF 的完美兼容
-  local C_CYAN=$(printf '\033[1;36m')
-  local C_GREEN=$(printf '\033[1;32m')
-  local C_YELLOW=$(printf '\033[1;33m')
-  local C_PURPLE=$(printf '\033[1;35m')
-  local C_BOLD=$(printf '\033[1m')
-  local C_RESET=$(printf '\033[0m')
+  C_CYAN=$(printf '\033[1;36m')
+  C_GREEN=$(printf '\033[1;32m')
+  C_YELLOW=$(printf '\033[1;33m')
+  C_PURPLE=$(printf '\033[1;35m')
+  C_BOLD=$(printf '\033[1m')
+  C_RESET=$(printf '\033[0m')
 
   while true; do
     clear 2>/dev/null || true
@@ -1001,20 +1001,20 @@ ${C_CYAN}====================================================${C_RESET}
   >  ${C_BOLD}版本${C_RESET}：${C_PURPLE}${SCRIPT_VERSION}${C_RESET}
   >  ${C_BOLD}状态${C_RESET}：${current_status}
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_YELLOW}[+] 核心管理${C_RESET}
-   ${C_GREEN}1.${C_RESET} 一键安装 mihomo 内核
-   ${C_GREEN}8.${C_RESET} 更新管理脚本
-   ${C_GREEN}9.${C_RESET} 彻底卸载脚本
-
  ${C_YELLOW}[+] 节点管理${C_RESET}
-   ${C_GREEN}2.${C_RESET} 一键生成代理节点
-   ${C_GREEN}3.${C_RESET} 查看所有节点链接
-   ${C_GREEN}4.${C_RESET} 删除特定节点
+   ${C_GREEN}1.${C_RESET} 一键生成代理节点
+   ${C_GREEN}2.${C_RESET} 查看所有节点链接
+   ${C_GREEN}3.${C_RESET} 删除特定节点
 
+ ${C_YELLOW}[+] 核心管理${C_RESET}
+   ${C_GREEN}4.${C_RESET} 一键安装 mihomo 内核
+   ${C_GREEN}5.${C_RESET} 更新管理脚本
+   ${C_GREEN}6.${C_RESET} 彻底卸载脚本
+   
  ${C_YELLOW}[+] 服务运维${C_RESET}
-   ${C_GREEN}5.${C_RESET} 查看 YAML 配置文件
-   ${C_GREEN}6.${C_RESET} 重启 Mihomo 服务
-   ${C_GREEN}7.${C_RESET} 查看服务实时日志
+   ${C_GREEN}7.${C_RESET} 查看 YAML 配置文件
+   ${C_GREEN}8.${C_RESET} 重启 Mihomo 服务
+   ${C_GREEN}9.${C_RESET} 查看服务实时日志
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
@@ -1023,15 +1023,15 @@ EOF
     read -r choice || exit 0
 
     case "$choice" in
-      1) install_core; pause ;;
-      2) add_node; pause ;;
-      3) show_all_nodes; pause ;;
-      4) delete_node; pause ;;
-      5) show_config; pause ;;
-      6) need_root; ensure_installed; restart_service; green "服务已重启。"; pause ;;
-      7) show_logs ;;
-      8) update_script; pause ;;
-      9) uninstall_all; pause ;;
+      1) add_node; pause ;;
+      2) show_all_nodes; pause ;;
+      3) delete_node; pause ;;
+      4) install_core; pause ;;
+      5) update_script; pause ;;
+      6) uninstall_all; pause ;;
+      7) show_config; pause ;;
+      8) need_root; ensure_installed; restart_service; green "服务已重启。"; pause ;;
+      9) show_logs ;;
       0) clear; exit 0 ;;
       *) red "无效选择，请输入 0-9 之间的数字。"; pause ;;
     esac
