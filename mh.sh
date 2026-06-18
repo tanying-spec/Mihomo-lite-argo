@@ -4,7 +4,7 @@ set -u
 
 APP_NAME="Mihomo-lite"
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -995,28 +995,28 @@ menu() {
     
     cat <<EOF
 ${C_CYAN}====================================================${C_RESET}
- ✨ ${C_BOLD}Mihomo 一键配置管理面板${C_RESET}
+ [*] ${C_BOLD}Mihomo 一键配置管理面板${C_RESET}
 ${C_CYAN}====================================================${C_RESET}
- 👤 ${C_BOLD}作者${C_RESET}：${C_PURPLE}${SCRIPT_AUTHOR}${C_RESET}
- 🏷️ ${C_BOLD}版本${C_RESET}：${C_PURPLE}${SCRIPT_VERSION}${C_RESET}
- ⚡ ${C_BOLD}状态${C_RESET}：${current_status}
+  >  ${C_BOLD}作者${C_RESET}：${C_PURPLE}${SCRIPT_AUTHOR}${C_RESET}
+  >  ${C_BOLD}版本${C_RESET}：${C_PURPLE}${SCRIPT_VERSION}${C_RESET}
+  >  ${C_BOLD}状态${C_RESET}：${current_status}
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_YELLOW}📦 核心管理${C_RESET}
+ ${C_YELLOW}[+] 核心管理${C_RESET}
    ${C_GREEN}1.${C_RESET} 一键安装 mihomo 内核
    ${C_GREEN}8.${C_RESET} 更新管理脚本
    ${C_GREEN}9.${C_RESET} 彻底卸载脚本
 
- ${C_YELLOW}🔗 节点管理${C_RESET}
+ ${C_YELLOW}[+] 节点管理${C_RESET}
    ${C_GREEN}2.${C_RESET} 一键生成代理节点
    ${C_GREEN}3.${C_RESET} 查看所有节点链接
    ${C_GREEN}4.${C_RESET} 删除特定节点
 
- ${C_YELLOW}⚙️ 服务运维${C_RESET}
+ ${C_YELLOW}[+] 服务运维${C_RESET}
    ${C_GREEN}5.${C_RESET} 查看 YAML 配置文件
    ${C_GREEN}6.${C_RESET} 重启 Mihomo 服务
    ${C_GREEN}7.${C_RESET} 查看服务实时日志
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_GREEN}0.${C_RESET} 🚪 退出脚本面板
+ ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
 EOF
     printf "${C_BOLD}请输入数字选择 (0-9)：${C_RESET}"
