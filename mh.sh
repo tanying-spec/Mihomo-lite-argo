@@ -75,11 +75,11 @@ service_manager() {
 
 install_packages() {
   if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl gzip tar >/dev/null
+    apk add --no-cache ca-certificates curl gzip openssl tar >/dev/null
   elif command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl gzip tar
+    apt-get install -y ca-certificates curl gzip openssl tar
   else
     red "未找到 apk 或 apt-get，无法自动安装依赖。"
     exit 1
@@ -127,6 +127,86 @@ latest_download_url() {
 rand_alnum() {
   length="${1:-32}"
   LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$length"
+}
+
+rand_hex() {
+  bytes="${1:-4}"
+  od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+new_uuid() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    h="$(rand_hex 16)"
+    printf '%s-%s-%s-%s-%s\n' \
+      "$(printf '%s' "$h" | cut -c1-8)" \
+      "$(printf '%s' "$h" | cut -c9-12)" \
+      "$(printf '%s' "$h" | cut -c13-16)" \
+      "$(printf '%s' "$h" | cut -c17-20)" \
+      "$(printf '%s' "$h" | cut -c21-32)"
+  fi
+}
+
+url_path() {
+  value="${1:-/}"
+  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/\//%2F/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g'
+}
+
+need_openssl() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    red "缺少 openssl，请先在菜单输入 1 安装/补齐依赖。"
+    exit 1
+  fi
+}
+
+base64_urlsafe() {
+  base64 | tr '+/' '-_' | tr -d '=\n'
+}
+
+create_reality_keypair() {
+  need_openssl
+  key_file="$CONFIG_DIR/reality.key.$$"
+  openssl genpkey -algorithm X25519 -out "$key_file" >/dev/null 2>&1 || {
+    rm -f "$key_file"
+    red "生成 Reality X25519 密钥失败。"
+    exit 1
+  }
+  private_key="$(openssl pkey -in "$key_file" -outform DER 2>/dev/null | tail -c 32 | base64_urlsafe)"
+  public_key="$(openssl pkey -in "$key_file" -pubout -outform DER 2>/dev/null | tail -c 32 | base64_urlsafe)"
+  rm -f "$key_file"
+
+  if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+    red "解析 Reality 密钥失败。"
+    exit 1
+  fi
+
+  printf '%s|%s' "$private_key" "$public_key"
+}
+
+ensure_tls_cert() {
+  need_openssl
+  cert_name="$1"
+  sni="$2"
+  cert_dir="$CONFIG_DIR/certs"
+  cert_file="$cert_dir/${cert_name}.crt"
+  key_file="$cert_dir/${cert_name}.key"
+  mkdir -p "$cert_dir"
+
+  if [ ! -s "$cert_file" ] || [ ! -s "$key_file" ]; then
+    openssl req -x509 -nodes -newkey ec \
+      -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "$key_file" \
+      -out "$cert_file" \
+      -subj "/CN=$sni" \
+      -days 3650 >/dev/null 2>&1 || {
+        red "生成 TLS 自签证书失败。"
+        exit 1
+      }
+    chmod 600 "$key_file" "$cert_file"
+  fi
+
+  printf '%s|%s' "$cert_file" "$key_file"
 }
 
 random_port() {
@@ -182,17 +262,93 @@ EOF
 
   if [ -s "$NODES_DB" ]; then
     printf 'listeners:\n' >> "$tmp_file"
-    while IFS='|' read -r node_name node_port node_cipher node_password; do
-      [ -n "$node_name" ] || continue
-      cat >> "$tmp_file" <<EOF
+    while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
+      [ -n "$proto" ] || continue
+      case "$proto" in
+        vless-reality)
+          node_uuid="$value1"
+          sni="$value2"
+          dest="$value3"
+          private_key="$value4"
+          short_id="$value6"
+          cat >> "$tmp_file" <<EOF
   - name: "$node_name"
-    type: shadowsocks
+    type: vless
     port: $node_port
     listen: 0.0.0.0
-    cipher: $node_cipher
-    password: "$node_password"
+    users:
+      - username: "$node_name"
+        uuid: "$node_uuid"
+    tls: true
+    reality-config:
+      dest: "$dest"
+      private-key: "$private_key"
+      short-id:
+        - "$short_id"
+      server-names:
+        - "$sni"
+EOF
+          ;;
+        hysteria2)
+          node_password="$value1"
+          cert_file="$value3"
+          key_file="$value4"
+          cat >> "$tmp_file" <<EOF
+  - name: "$node_name"
+    type: hysteria2
+    port: $node_port
+    listen: 0.0.0.0
+    users:
+      "$node_name": "$node_password"
+    certificate: "$cert_file"
+    private-key: "$key_file"
+EOF
+          ;;
+        anytls)
+          node_password="$value1"
+          cert_file="$value3"
+          key_file="$value4"
+          cat >> "$tmp_file" <<EOF
+  - name: "$node_name"
+    type: anytls
+    port: $node_port
+    listen: 0.0.0.0
+    users:
+      "$node_name": "$node_password"
+    certificate: "$cert_file"
+    private-key: "$key_file"
+EOF
+          ;;
+        vless-ws)
+          node_uuid="$value1"
+          ws_path="$value2"
+          cat >> "$tmp_file" <<EOF
+  - name: "$node_name"
+    type: vless
+    port: $node_port
+    listen: 0.0.0.0
+    users:
+      - username: "$node_name"
+        uuid: "$node_uuid"
+    ws-path: "$ws_path"
+EOF
+          ;;
+        *)
+          legacy_name="$proto"
+          legacy_port="$node_name"
+          legacy_cipher="$node_port"
+          legacy_password="$value1"
+          cat >> "$tmp_file" <<EOF
+  - name: "$legacy_name"
+    type: shadowsocks
+    port: $legacy_port
+    listen: 0.0.0.0
+    cipher: $legacy_cipher
+    password: "$legacy_password"
     udp: true
 EOF
+          ;;
+      esac
     done < "$NODES_DB"
   else
     printf 'listeners: []\n' >> "$tmp_file"
@@ -312,14 +468,37 @@ ensure_installed() {
   fi
 }
 
-add_node() {
-  need_root
-  ensure_installed
+node_name_exists() {
+  name="$1"
+  awk -F'|' -v n="$name" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      if ($2 == n) found = 1
+      next
+    }
+    $1 == n { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$NODES_DB" 2>/dev/null
+}
 
-  printf '请输入节点名称（默认 ss-%s）：' "$(date +%m%d%H%M)"
+port_in_use() {
+  port="$1"
+  awk -F'|' -v p="$port" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      if ($3 == p) found = 1
+      next
+    }
+    $2 == p { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$NODES_DB" 2>/dev/null
+}
+
+prompt_node_name() {
+  proto_prefix="$1"
+  default_name="${proto_prefix}-$(date +%m%d%H%M)"
+  printf '请输入节点名称（默认 %s）：' "$default_name" >&2
   read -r node_name || true
   if [ -z "$node_name" ]; then
-    node_name="ss-$(date +%m%d%H%M)"
+    node_name="$default_name"
   fi
   node_name="$(printf '%s' "$node_name" | tr -cd 'A-Za-z0-9_.-')"
   if [ -z "$node_name" ]; then
@@ -327,13 +506,16 @@ add_node() {
     exit 1
   fi
 
-  if awk -F'|' -v n="$node_name" '$1 == n { found = 1 } END { exit found ? 0 : 1 }' "$NODES_DB" 2>/dev/null; then
+  if node_name_exists "$node_name"; then
     red "节点 $node_name 已存在。"
     exit 1
   fi
+  printf '%s' "$node_name"
+}
 
+prompt_port() {
   default_port="$(random_port)"
-  printf '请输入监听端口（默认 %s）：' "$default_port"
+  printf '请输入监听端口（默认 %s）：' "$default_port" >&2
   read -r node_port || true
   [ -n "$node_port" ] || node_port="$default_port"
 
@@ -348,33 +530,207 @@ add_node() {
     exit 1
   fi
 
-  if awk -F'|' -v p="$node_port" '$2 == p { found = 1 } END { exit found ? 0 : 1 }' "$NODES_DB" 2>/dev/null; then
+  if port_in_use "$node_port"; then
     red "端口 $node_port 已被脚本内的其他节点使用。"
     exit 1
   fi
+  printf '%s' "$node_port"
+}
 
-  node_cipher="chacha20-ietf-poly1305"
-  node_password="$(rand_alnum 32)"
-  printf '%s|%s|%s|%s\n' "$node_name" "$node_port" "$node_cipher" "$node_password" >> "$NODES_DB"
+append_node() {
+  printf '%s\n' "$1" >> "$NODES_DB"
   chmod 600 "$NODES_DB"
   render_config
   restart_service
+}
 
-  server_ip="$(public_ip)"
-  green "节点已生成并重启服务。"
+node_share_link() {
+  proto="$1"
+  node_name="$2"
+  node_port="$3"
+  value1="${4:-}"
+  value2="${5:-}"
+  value3="${6:-}"
+  value4="${7:-}"
+  value5="${8:-}"
+  value6="${9:-}"
+  server_ip="${SHARE_SERVER_IP:-$(public_ip)}"
+  link_name="$(url_path "$node_name")"
+
+  case "$proto" in
+    vless-reality)
+      node_uuid="$value1"
+      sni="$value2"
+      public_key="$value5"
+      short_id="$value6"
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+        "$node_uuid" "$server_ip" "$node_port" "$sni" "$public_key" "$short_id" "$link_name"
+      ;;
+    hysteria2)
+      node_password="$value1"
+      sni="$value2"
+      printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s#%s\n' \
+        "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+      ;;
+    anytls)
+      node_password="$value1"
+      sni="$value2"
+      printf 'anytls://%s@%s:%s?insecure=1&sni=%s#%s\n' \
+        "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+      ;;
+    vless-ws)
+      node_uuid="$value1"
+      ws_path="$(url_path "$value2")"
+      printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#%s\n' \
+        "$node_uuid" "$server_ip" "$node_port" "$server_ip" "$ws_path" "$link_name"
+      ;;
+    *)
+      node_cipher="$value1"
+      node_password="$value2"
+      printf 'ss://%s@%s:%s#%s\n' \
+        "$(printf '%s:%s' "$node_cipher" "$node_password" | base64 | tr -d '\n')" \
+        "$server_ip" "$node_port" "$link_name"
+      ;;
+  esac
+}
+
+print_node_link() {
+  proto="$1"
+  node_name="$2"
+  node_port="$3"
+  value1="${4:-}"
+  value2="${5:-}"
+  value3="${6:-}"
+  value4="${7:-}"
+  value5="${8:-}"
+  value6="${9:-}"
   cat <<EOF
 
 请确认 VPS 防火墙和云厂商安全组已放行 TCP/UDP $node_port。
 
-mihomo 客户端节点片段：
-- name: $node_name
-  type: ss
-  server: $server_ip
-  port: $node_port
-  cipher: $node_cipher
-  password: "$node_password"
-  udp: true
+节点链接：
+$(node_share_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")
 EOF
+}
+
+add_vless_reality_node() {
+  node_name="$(prompt_node_name vless-reality)" || exit 1
+  node_port="$(prompt_port)" || exit 1
+  printf '请输入 Reality SNI（默认 www.microsoft.com）：'
+  read -r sni || true
+  [ -n "$sni" ] || sni="www.microsoft.com"
+  printf '请输入 Reality 目标地址 dest（默认 %s:443）：' "$sni"
+  read -r dest || true
+  [ -n "$dest" ] || dest="${sni}:443"
+  node_uuid="$(new_uuid)"
+  key_pair="$(create_reality_keypair)" || exit 1
+  private_key="${key_pair%%|*}"
+  public_key="${key_pair#*|}"
+  short_id="$(rand_hex 8)"
+  append_node "vless-reality|$node_name|$node_port|$node_uuid|$sni|$dest|$private_key|$public_key|$short_id"
+  green "VLESS + Reality 节点已生成并重启服务。"
+  print_node_link vless-reality "$node_name" "$node_port" "$node_uuid" "$sni" "$dest" "$private_key" "$public_key" "$short_id"
+}
+
+add_hysteria2_node() {
+  node_name="$(prompt_node_name hy2)" || exit 1
+  node_port="$(prompt_port)" || exit 1
+  printf '请输入 TLS SNI / 证书域名（默认 bing.com）：'
+  read -r sni || true
+  [ -n "$sni" ] || sni="bing.com"
+  node_password="$(rand_alnum 32)"
+  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
+  cert_file="${cert_pair%%|*}"
+  key_file="${cert_pair#*|}"
+  append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||"
+  green "Hysteria2 节点已生成并重启服务。"
+  print_node_link hysteria2 "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "" ""
+}
+
+add_anytls_node() {
+  node_name="$(prompt_node_name anytls)" || exit 1
+  node_port="$(prompt_port)" || exit 1
+  printf '请输入 TLS SNI / 证书域名（默认 bing.com）：'
+  read -r sni || true
+  [ -n "$sni" ] || sni="bing.com"
+  node_password="$(rand_alnum 32)"
+  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
+  cert_file="${cert_pair%%|*}"
+  key_file="${cert_pair#*|}"
+  append_node "anytls|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||"
+  green "AnyTLS 节点已生成并重启服务。"
+  print_node_link anytls "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "" ""
+}
+
+add_vless_ws_node() {
+  node_name="$(prompt_node_name vless-ws)" || exit 1
+  node_port="$(prompt_port)" || exit 1
+  default_path="/$(rand_alnum 10)"
+  printf '请输入 WebSocket 路径（默认 %s）：' "$default_path"
+  read -r ws_path || true
+  [ -n "$ws_path" ] || ws_path="$default_path"
+  case "$ws_path" in
+    /*) ;;
+    *) ws_path="/$ws_path" ;;
+  esac
+  node_uuid="$(new_uuid)"
+  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path||||"
+  green "VLESS + WS 节点已生成并重启服务。"
+  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "" "" "" ""
+}
+
+add_node() {
+  need_root
+  ensure_installed
+
+  cat <<'EOF'
+请选择要创建的节点协议：
+  1. vless + reality
+  2. hysteria2
+  3. anytls
+  4. vless + ws
+  0. 返回主菜单
+EOF
+  printf '请输入数字选择：'
+  read -r protocol_choice || true
+
+  case "$protocol_choice" in
+    1) add_vless_reality_node ;;
+    2) add_hysteria2_node ;;
+    3) add_anytls_node ;;
+    4) add_vless_ws_node ;;
+    0) return 0 ;;
+    *) red "无效选择。"; exit 1 ;;
+  esac
+}
+
+show_all_nodes() {
+  if [ ! -s "$NODES_DB" ]; then
+    yellow "当前没有节点。"
+    return 1
+  fi
+
+  i=1
+  SHARE_SERVER_IP="$(public_ip)"
+  export SHARE_SERVER_IP
+  while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
+    [ -n "$proto" ] || continue
+    case "$proto" in
+      vless-reality|hysteria2|anytls|vless-ws)
+        printf '%s. %s  protocol=%s  port=%s\n' "$i" "$node_name" "$proto" "$node_port"
+        printf '   %s\n' "$(node_share_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")"
+        ;;
+      *)
+        legacy_name="$proto"
+        legacy_port="$node_name"
+        legacy_cipher="$node_port"
+        legacy_password="$value1"
+        printf '%s. %s  protocol=shadowsocks  port=%s\n' "$i" "$legacy_name" "$legacy_port"
+        printf '   %s\n' "$(node_share_link shadowsocks "$legacy_name" "$legacy_port" "$legacy_cipher" "$legacy_password" "" "" "" "")"
+        ;;
+    esac
+    i=$((i + 1))
+  done < "$NODES_DB"
 }
 
 list_nodes() {
@@ -384,9 +740,16 @@ list_nodes() {
   fi
 
   i=1
-  while IFS='|' read -r node_name node_port node_cipher node_password; do
-    [ -n "$node_name" ] || continue
-    printf '%s. %s  port=%s  cipher=%s\n' "$i" "$node_name" "$node_port" "$node_cipher"
+  while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
+    [ -n "$proto" ] || continue
+    case "$proto" in
+      vless-reality|hysteria2|anytls|vless-ws)
+        printf '%s. %s  protocol=%s  port=%s\n' "$i" "$node_name" "$proto" "$node_port"
+        ;;
+      *)
+        printf '%s. %s  protocol=shadowsocks  port=%s\n' "$i" "$proto" "$node_name"
+        ;;
+    esac
     i=$((i + 1))
   done < "$NODES_DB"
 }
@@ -407,7 +770,7 @@ delete_node() {
   esac
 
   tmp_file="$NODES_DB.tmp"
-  deleted="$(awk -F'|' -v n="$choice" 'NR == n { print $1 }' "$NODES_DB")"
+  deleted="$(awk -F'|' -v n="$choice" 'NR == n { if ($1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws") print $2; else print $1 }' "$NODES_DB")"
   if [ -z "$deleted" ]; then
     red "未找到编号 $choice。"
     exit 1
@@ -419,6 +782,16 @@ delete_node() {
   render_config
   restart_service
   green "节点 $deleted 已删除，服务已重启。"
+}
+
+show_config() {
+  need_root
+  ensure_installed
+  if command -v less >/dev/null 2>&1; then
+    less "$CONFIG_FILE"
+  else
+    cat "$CONFIG_FILE"
+  fi
 }
 
 show_logs() {
@@ -477,10 +850,12 @@ menu() {
 ========================================
   1. 一键安装 mihomo 内核
   2. 一键生成节点
-  3. 删除节点
-  4. 重启服务
-  5. 查看实时日志
-  6. 卸载脚本
+  3. 查看所有节点
+  4. 删除节点
+  5. 查看配置文件
+  6. 重启服务
+  7. 查看实时日志
+  8. 卸载脚本
   0. 退出脚本
 ========================================
 EOF
@@ -490,10 +865,12 @@ EOF
     case "$choice" in
       1) install_core; pause ;;
       2) add_node; pause ;;
-      3) delete_node; pause ;;
-      4) need_root; ensure_installed; restart_service; green "服务已重启。"; pause ;;
-      5) show_logs ;;
-      6) uninstall_all; pause ;;
+      3) show_all_nodes; pause ;;
+      4) delete_node; pause ;;
+      5) show_config; pause ;;
+      6) need_root; ensure_installed; restart_service; green "服务已重启。"; pause ;;
+      7) show_logs ;;
+      8) uninstall_all; pause ;;
       0) exit 0 ;;
       *) red "无效选择。"; pause ;;
     esac
@@ -503,6 +880,8 @@ EOF
 case "${1:-}" in
   install) install_core ;;
   add) add_node ;;
+  list|nodes) show_all_nodes ;;
+  config) show_config ;;
   delete|del|remove) delete_node ;;
   restart) need_root; ensure_installed; restart_service ;;
   logs|log) show_logs ;;
