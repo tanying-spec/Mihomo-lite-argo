@@ -164,6 +164,10 @@ base64_urlsafe() {
   base64 | tr '+/' '-_' | tr -d '=\n'
 }
 
+base64_one_line() {
+  base64 | tr -d '\n'
+}
+
 create_reality_keypair() {
   need_openssl
   key_file="$CONFIG_DIR/reality.key.$$"
@@ -293,6 +297,7 @@ EOF
           node_password="$value1"
           cert_file="$value3"
           key_file="$value4"
+          salamander_password="$value5"
           cat >> "$tmp_file" <<EOF
   - name: "$node_name"
     type: hysteria2
@@ -303,6 +308,12 @@ EOF
     certificate: "$cert_file"
     private-key: "$key_file"
 EOF
+          if [ -n "$salamander_password" ]; then
+            cat >> "$tmp_file" <<EOF
+    obfs: salamander
+    obfs-password: "$salamander_password"
+EOF
+          fi
           ;;
         anytls)
           node_password="$value1"
@@ -322,6 +333,7 @@ EOF
         vless-ws)
           node_uuid="$value1"
           ws_path="$value2"
+          ws_host="$value3"
           cat >> "$tmp_file" <<EOF
   - name: "$node_name"
     type: vless
@@ -495,7 +507,7 @@ port_in_use() {
 prompt_node_name() {
   proto_prefix="$1"
   default_name="${proto_prefix}-$(date +%m%d%H%M)"
-  printf '请输入节点名称（默认 %s）：' "$default_name" >&2
+  printf '请输入节点名称（默认 %s）：' "$default_name"
   read -r node_name || true
   if [ -z "$node_name" ]; then
     node_name="$default_name"
@@ -510,12 +522,12 @@ prompt_node_name() {
     red "节点 $node_name 已存在。"
     exit 1
   fi
-  printf '%s' "$node_name"
+  SELECTED_NODE_NAME="$node_name"
 }
 
 prompt_port() {
   default_port="$(random_port)"
-  printf '请输入监听端口（默认 %s）：' "$default_port" >&2
+  printf '请输入监听端口（默认 %s）：' "$default_port"
   read -r node_port || true
   [ -n "$node_port" ] || node_port="$default_port"
 
@@ -534,7 +546,7 @@ prompt_port() {
     red "端口 $node_port 已被脚本内的其他节点使用。"
     exit 1
   fi
-  printf '%s' "$node_port"
+  SELECTED_NODE_PORT="$node_port"
 }
 
 append_node() {
@@ -569,8 +581,14 @@ node_share_link() {
     hysteria2)
       node_password="$value1"
       sni="$value2"
-      printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s#%s\n' \
-        "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+      salamander_password="$value5"
+      if [ -n "$salamander_password" ]; then
+        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&obfs=salamander&obfs-password=%s#%s\n' \
+          "$node_password" "$server_ip" "$node_port" "$sni" "$salamander_password" "$link_name"
+      else
+        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s#%s\n' \
+          "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+      fi
       ;;
     anytls)
       node_password="$value1"
@@ -581,8 +599,9 @@ node_share_link() {
     vless-ws)
       node_uuid="$value1"
       ws_path="$(url_path "$value2")"
+      ws_host="${value3:-$server_ip}"
       printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#%s\n' \
-        "$node_uuid" "$server_ip" "$node_port" "$server_ip" "$ws_path" "$link_name"
+        "$node_uuid" "$server_ip" "$node_port" "$ws_host" "$ws_path" "$link_name"
       ;;
     *)
       node_cipher="$value1"
@@ -614,8 +633,10 @@ EOF
 }
 
 add_vless_reality_node() {
-  node_name="$(prompt_node_name vless-reality)" || exit 1
-  node_port="$(prompt_port)" || exit 1
+  prompt_node_name vless-reality
+  node_name="$SELECTED_NODE_NAME"
+  prompt_port
+  node_port="$SELECTED_NODE_PORT"
   printf '请输入 Reality SNI（默认 www.microsoft.com）：'
   read -r sni || true
   [ -n "$sni" ] || sni="www.microsoft.com"
@@ -633,23 +654,40 @@ add_vless_reality_node() {
 }
 
 add_hysteria2_node() {
-  node_name="$(prompt_node_name hy2)" || exit 1
-  node_port="$(prompt_port)" || exit 1
+  prompt_node_name hy2
+  node_name="$SELECTED_NODE_NAME"
+  prompt_port
+  node_port="$SELECTED_NODE_PORT"
   printf '请输入 TLS SNI / 证书域名（默认 bing.com）：'
   read -r sni || true
   [ -n "$sni" ] || sni="bing.com"
-  node_password="$(rand_alnum 32)"
+  default_password="$(rand_alnum 32)"
+  printf '请输入 Hysteria2 密码（默认随机生成）：'
+  read -r node_password || true
+  [ -n "$node_password" ] || node_password="$default_password"
+  node_password="$(printf '%s' "$node_password" | tr -cd 'A-Za-z0-9._~-')"
+  [ -n "$node_password" ] || node_password="$default_password"
+  printf '是否开启 Salamander 混淆？[y/N]：'
+  read -r enable_salamander || true
+  salamander_password=""
+  case "$enable_salamander" in
+    y|Y|yes|YES)
+      salamander_password="$(rand_alnum 32)"
+      ;;
+  esac
   cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
   cert_file="${cert_pair%%|*}"
   key_file="${cert_pair#*|}"
-  append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||"
+  append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file|$salamander_password|"
   green "Hysteria2 节点已生成并重启服务。"
-  print_node_link hysteria2 "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "" ""
+  print_node_link hysteria2 "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "$salamander_password" ""
 }
 
 add_anytls_node() {
-  node_name="$(prompt_node_name anytls)" || exit 1
-  node_port="$(prompt_port)" || exit 1
+  prompt_node_name anytls
+  node_name="$SELECTED_NODE_NAME"
+  prompt_port
+  node_port="$SELECTED_NODE_PORT"
   printf '请输入 TLS SNI / 证书域名（默认 bing.com）：'
   read -r sni || true
   [ -n "$sni" ] || sni="bing.com"
@@ -663,8 +701,15 @@ add_anytls_node() {
 }
 
 add_vless_ws_node() {
-  node_name="$(prompt_node_name vless-ws)" || exit 1
-  node_port="$(prompt_port)" || exit 1
+  prompt_node_name vless-ws
+  node_name="$SELECTED_NODE_NAME"
+  prompt_port
+  node_port="$SELECTED_NODE_PORT"
+  server_ip="$(public_ip)"
+  printf '请输入 WebSocket 域名/Host（默认 %s）：' "$server_ip"
+  read -r ws_host || true
+  [ -n "$ws_host" ] || ws_host="$server_ip"
+  ws_host="$(printf '%s' "$ws_host" | tr -d '|')"
   default_path="/$(rand_alnum 10)"
   printf '请输入 WebSocket 路径（默认 %s）：' "$default_path"
   read -r ws_path || true
@@ -674,9 +719,9 @@ add_vless_ws_node() {
     *) ws_path="/$ws_path" ;;
   esac
   node_uuid="$(new_uuid)"
-  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path||||"
+  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path|$ws_host|||"
   green "VLESS + WS 节点已生成并重启服务。"
-  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "" "" "" ""
+  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "" "" ""
 }
 
 add_node() {
@@ -713,24 +758,43 @@ show_all_nodes() {
   i=1
   SHARE_SERVER_IP="$(public_ip)"
   export SHARE_SERVER_IP
+  sub_file="/tmp/mihomo-sub.$$"
+  : > "$sub_file"
   while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
     [ -n "$proto" ] || continue
     case "$proto" in
       vless-reality|hysteria2|anytls|vless-ws)
+        node_link="$(node_share_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")"
         printf '%s. %s  protocol=%s  port=%s\n' "$i" "$node_name" "$proto" "$node_port"
-        printf '   %s\n' "$(node_share_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")"
+        printf '   %s\n' "$node_link"
+        printf '%s\n' "$node_link" >> "$sub_file"
         ;;
       *)
         legacy_name="$proto"
         legacy_port="$node_name"
         legacy_cipher="$node_port"
         legacy_password="$value1"
+        node_link="$(node_share_link shadowsocks "$legacy_name" "$legacy_port" "$legacy_cipher" "$legacy_password" "" "" "" "")"
         printf '%s. %s  protocol=shadowsocks  port=%s\n' "$i" "$legacy_name" "$legacy_port"
-        printf '   %s\n' "$(node_share_link shadowsocks "$legacy_name" "$legacy_port" "$legacy_cipher" "$legacy_password" "" "" "" "")"
+        printf '   %s\n' "$node_link"
+        printf '%s\n' "$node_link" >> "$sub_file"
         ;;
     esac
     i=$((i + 1))
   done < "$NODES_DB"
+
+  if [ -s "$sub_file" ]; then
+    sub_base64="$(base64_one_line < "$sub_file")"
+    cat <<EOF
+
+聚合订阅 Base64：
+$sub_base64
+
+聚合订阅 Data URI：
+data:text/plain;base64,$sub_base64
+EOF
+  fi
+  rm -f "$sub_file"
 }
 
 list_nodes() {
