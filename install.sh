@@ -2,7 +2,7 @@
 
 set -u
 
-RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/YOUR_GITHUB_USER/mihomo-onekey/main}"
+RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main}"
 CLI_PATH="/usr/local/bin/mh"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }

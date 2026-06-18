@@ -19,19 +19,7 @@
 项目推送到 GitHub 后，把下面命令中的 `<用户名>` 和 `<仓库>` 替换为你的仓库信息：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/<用户名>/<仓库>/main/install.sh | sudo sh
-```
-
-如果你还没有推送到 GitHub，也可以在项目目录内直接安装：
-
-```sh
-sudo sh install.sh
-```
-
-安装完成后打开管理面板：
-
-```sh
-sudo mh
+curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install.sh | sudo sh
 ```
 
 ## 目录和服务
@@ -45,31 +33,6 @@ sudo mh
 - 服务名：`mihomo`
 
 脚本会在 Debian/Ubuntu 上创建 systemd 服务，在 Alpine 上创建 OpenRC 服务。
-
-## GitHub 发布前需要改的地方
-
-打开 `install.sh`，把这一行里的占位地址替换为你的 GitHub 仓库地址：
-
-```sh
-RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/YOUR_GITHUB_USER/mihomo-onekey/main}"
-```
-
-例如：
-
-```sh
-RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/alice/mihomo-onekey/main}"
-```
-
-## 节点说明
-
-当前脚本生成的是 mihomo `listeners` 中的 Shadowsocks 入站节点，默认使用：
-
-- 协议：Shadowsocks
-- 加密：`chacha20-ietf-poly1305`
-- 监听：`0.0.0.0`
-- UDP：开启
-
-生成节点后，请确认 VPS 系统防火墙和云厂商安全组已经放行对应端口的 TCP/UDP。
 
 ## 参考
 
