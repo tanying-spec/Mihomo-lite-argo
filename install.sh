@@ -32,14 +32,32 @@ install_curl() {
   fi
 }
 
+make_temp() {
+  mktemp "$1" 2>/dev/null || {
+    red "无法创建临时文件：$1"
+    exit 1
+  }
+}
+
 need_root
 install_curl
 
+tmp_file="$(make_temp /tmp/mh-install.XXXXXX)"
 if [ -f "./mh.sh" ]; then
-  cp ./mh.sh "$CLI_PATH"
+  cp ./mh.sh "$tmp_file"
 else
-  curl -fsSL "$RAW_BASE/mh.sh" -o "$CLI_PATH"
+  curl -fsSL "$RAW_BASE/mh.sh" -o "$tmp_file" || {
+    rm -f "$tmp_file"
+    exit 1
+  }
 fi
 
-chmod +x "$CLI_PATH"
+if ! sh -n "$tmp_file" 2>/dev/null; then
+  rm -f "$tmp_file"
+  red "安装失败：脚本语法检查未通过。"
+  exit 1
+fi
+
+chmod +x "$tmp_file"
+mv "$tmp_file" "$CLI_PATH"
 green "安装完成。现在可以输入 mh 打开管理面板。"

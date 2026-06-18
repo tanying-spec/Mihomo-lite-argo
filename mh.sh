@@ -2,7 +2,6 @@
 
 set -u
 
-APP_NAME="Mihomo-lite"
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_VERSION="1.0.5"
 BIN_PATH="/usr/local/bin/mihomo"
@@ -16,9 +15,6 @@ GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/r
 SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/mh.sh}"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
-green() { printf '\033[32m%s\033[0m\n' "$*"; }
-yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
-info() { printf '%s\n' "$*"; }
 
 C_CYAN=$(printf '\033[1;36m')
 C_GREEN=$(printf '\033[1;32m')
@@ -34,6 +30,10 @@ ui_title() {
   ui_line
   printf ' [*] %s%s%s\n' "$C_BOLD" "$1" "$C_RESET"
   ui_line
+}
+screen_title() {
+  clear 2>/dev/null || true
+  ui_title "$1"
 }
 ui_section() { printf ' %s[+] %s%s\n' "$C_YELLOW" "$1" "$C_RESET"; }
 ui_prompt() { printf '%s%s%s' "$C_BOLD" "$1" "$C_RESET"; }
@@ -126,34 +126,28 @@ service_status_text() {
   esac
 }
 
-ensure_curl() {
-  if command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl
-  elif command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ca-certificates curl
-  else
-    red "未找到 apk 或 apt-get，无法自动安装 curl。"
-    exit 1
-  fi
-}
-
 install_packages() {
   if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl gzip openssl tar >/dev/null
+    apk add --no-cache ca-certificates "$@" >/dev/null
   elif command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl gzip openssl tar
+    apt-get install -y ca-certificates "$@"
   else
     red "未找到 apk 或 apt-get，无法自动安装依赖。"
     exit 1
   fi
+}
+
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 || install_packages curl
+}
+
+make_temp() {
+  mktemp "$1" 2>/dev/null || {
+    red "无法创建临时文件：$1"
+    exit 1
+  }
 }
 
 detect_arch() {
@@ -414,21 +408,6 @@ EOF
     ws-path: "$cfg_ws_path"
 EOF
           ;;
-        *)
-          cfg_legacy_name="$cfg_proto"
-          cfg_legacy_port="$cfg_node_name"
-          cfg_legacy_cipher="$cfg_node_port"
-          cfg_legacy_password="$cfg_value1"
-          cat >> "$tmp_file" <<EOF
-  - name: "$cfg_legacy_name"
-    type: shadowsocks
-    port: $cfg_legacy_port
-    listen: 0.0.0.0
-    cipher: $cfg_legacy_cipher
-    password: "$cfg_legacy_password"
-    udp: true
-EOF
-          ;;
       esac
     done < "$NODES_DB"
   else
@@ -512,20 +491,28 @@ restart_service() {
 
 install_core() {
   need_root
-  clear 2>/dev/null || true
-  ui_title "一键安装 Mihomo 内核"
+  screen_title "一键安装 Mihomo 内核"
   detect_os
   ui_section "安装系统依赖"
-  install_packages
+  install_packages curl gzip openssl
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 
   download_url="$(latest_download_url)"
-  tmp_file="/tmp/mihomo.$$"
+  tmp_file="$(make_temp /tmp/mihomo.XXXXXX)"
+  bin_tmp="$(make_temp /tmp/mihomo-bin.XXXXXX)"
 
   ui_warn "下载地址：$download_url"
   ui_section "下载并安装 Mihomo 内核"
-  curl -fL "$download_url" -o "$tmp_file"
-  gzip -dc "$tmp_file" > "$BIN_PATH"
+  curl -fL "$download_url" -o "$tmp_file" || {
+    rm -f "$tmp_file" "$bin_tmp"
+    exit 1
+  }
+  gzip -dc "$tmp_file" > "$bin_tmp" || {
+    rm -f "$tmp_file" "$bin_tmp"
+    exit 1
+  }
+  chmod +x "$bin_tmp"
+  mv "$bin_tmp" "$BIN_PATH"
   rm -f "$tmp_file"
   chmod +x "$BIN_PATH"
 
@@ -558,9 +545,7 @@ node_name_exists() {
   awk -F'|' -v n="$name" '
     $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
       if ($2 == n) found = 1
-      next
     }
-    $1 == n { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$NODES_DB" 2>/dev/null
 }
@@ -570,9 +555,7 @@ port_in_use() {
   awk -F'|' -v p="$port" '
     $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
       if ($3 == p) found = 1
-      next
     }
-    $2 == p { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$NODES_DB" 2>/dev/null
 }
@@ -676,13 +659,6 @@ node_share_link() {
       printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#%s\n' \
         "$node_uuid" "$server_ip" "$node_port" "$ws_host" "$ws_path" "$link_name"
       ;;
-    *)
-      node_cipher="$value1"
-      node_password="$value2"
-      printf 'ss://%s@%s:%s#%s\n' \
-        "$(printf '%s:%s' "$node_cipher" "$node_password" | base64 | tr -d '\n')" \
-        "$server_ip" "$node_port" "$link_name"
-      ;;
   esac
 }
 
@@ -713,8 +689,7 @@ EOF
 }
 
 add_vless_reality_node() {
-  clear 2>/dev/null || true
-  ui_title "创建 VLESS + Reality 节点"
+  screen_title "创建 VLESS + Reality 节点"
   prompt_node_name vless-reality
   node_name="$SELECTED_NODE_NAME"
   prompt_port
@@ -734,8 +709,7 @@ add_vless_reality_node() {
 }
 
 add_hysteria2_node() {
-  clear 2>/dev/null || true
-  ui_title "创建 Hysteria2 节点"
+  screen_title "创建 Hysteria2 节点"
   prompt_node_name hy2
   node_name="$SELECTED_NODE_NAME"
   prompt_port
@@ -766,8 +740,7 @@ add_hysteria2_node() {
 }
 
 add_anytls_node() {
-  clear 2>/dev/null || true
-  ui_title "创建 AnyTLS 节点"
+  screen_title "创建 AnyTLS 节点"
   prompt_node_name anytls
   node_name="$SELECTED_NODE_NAME"
   prompt_port
@@ -785,8 +758,7 @@ add_anytls_node() {
 }
 
 add_vless_ws_node() {
-  clear 2>/dev/null || true
-  ui_title "创建 VLESS + WebSocket 节点"
+  screen_title "创建 VLESS + WebSocket 节点"
   prompt_node_name vless-ws
   node_name="$SELECTED_NODE_NAME"
   prompt_port
@@ -849,13 +821,12 @@ show_all_nodes() {
     return 1
   fi
 
-  clear 2>/dev/null || true
-  ui_title "查看所有节点"
+  screen_title "查看所有节点"
   ui_section "节点列表"
   i=1
   SHARE_SERVER_IP="$(public_ip)"
   export SHARE_SERVER_IP
-  sub_file="/tmp/mihomo-sub.$$"
+  sub_file="$(make_temp /tmp/mihomo-sub.XXXXXX)"
   : > "$sub_file"
   while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
     [ -n "$proto" ] || continue
@@ -865,19 +836,9 @@ show_all_nodes() {
         printf ' %s%s.%s %s%s%s  protocol=%s  port=%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$node_name" "$C_RESET" "$proto" "$node_port"
         printf '   %s\n\n' "$node_link"
         printf '%s\n' "$node_link" >> "$sub_file"
-        ;;
-      *)
-        legacy_name="$proto"
-        legacy_port="$node_name"
-        legacy_cipher="$node_port"
-        legacy_password="$value1"
-        node_link="$(node_share_link shadowsocks "$legacy_name" "$legacy_port" "$legacy_cipher" "$legacy_password" "" "" "" "")"
-        printf ' %s%s.%s %s%s%s  protocol=shadowsocks  port=%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$legacy_name" "$C_RESET" "$legacy_port"
-        printf '   %s\n\n' "$node_link"
-        printf '%s\n' "$node_link" >> "$sub_file"
+        i=$((i + 1))
         ;;
     esac
-    i=$((i + 1))
   done < "$NODES_DB"
 
   if [ -s "$sub_file" ]; then
@@ -906,12 +867,9 @@ list_nodes() {
     case "$proto" in
       vless-reality|hysteria2|anytls|vless-ws)
         printf ' %s%s.%s %s%s%s  protocol=%s  port=%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$node_name" "$C_RESET" "$proto" "$node_port"
-        ;;
-      *)
-        printf ' %s%s.%s %s%s%s  protocol=shadowsocks  port=%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$proto" "$C_RESET" "$node_name"
+        i=$((i + 1))
         ;;
     esac
-    i=$((i + 1))
   done < "$NODES_DB"
 }
 
@@ -919,8 +877,7 @@ delete_node() {
   need_root
   ensure_installed
 
-  clear 2>/dev/null || true
-  ui_title "删除节点"
+  screen_title "删除节点"
   list_nodes || return 0
   ui_dash
   printf ' %s0.%s 返回上一级\n' "$C_GREEN" "$C_RESET"
@@ -959,8 +916,12 @@ delete_node() {
     return 0
   fi
 
-  tmp_file="$NODES_DB.tmp"
-  deleted="$(awk -F'|' -v n="$choice" 'NR == n { if ($1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws") print $2; else print $1 }' "$NODES_DB")"
+  deleted="$(awk -F'|' -v n="$choice" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      i++
+      if (i == n) { print $2; exit }
+    }
+  ' "$NODES_DB")"
   if [ -z "$deleted" ]; then
     ui_error "未找到编号 $choice。"
     exit 1
@@ -976,7 +937,14 @@ delete_node() {
       ;;
   esac
 
-  awk -v n="$choice" 'NR != n { print }' "$NODES_DB" > "$tmp_file"
+  tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
+  awk -F'|' -v n="$choice" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      i++
+      if (i == n) next
+    }
+    { print }
+  ' "$NODES_DB" > "$tmp_file"
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
   render_config
@@ -987,8 +955,7 @@ delete_node() {
 show_config() {
   need_root
   ensure_installed
-  clear 2>/dev/null || true
-  ui_title "查看 YAML 配置文件"
+  screen_title "查看 YAML 配置文件"
   ui_warn "配置文件路径：$CONFIG_FILE"
   ui_dash
   if command -v less >/dev/null 2>&1; then
@@ -1000,8 +967,7 @@ show_config() {
 
 show_logs() {
   ensure_installed
-  clear 2>/dev/null || true
-  ui_title "查看服务实时日志"
+  screen_title "查看服务实时日志"
   ui_warn "按 Ctrl+C 可停止查看日志并返回终端。"
   ui_dash
   manager="$(service_manager)"
@@ -1022,9 +988,8 @@ update_script() {
   need_root
   ensure_curl
 
-  clear 2>/dev/null || true
-  ui_title "更新管理脚本"
-  tmp_file="/tmp/mh-update.$$"
+  screen_title "更新管理脚本"
+  tmp_file="$(make_temp /tmp/mh-update.XXXXXX)"
   ui_warn "更新来源：$SCRIPT_RAW_URL"
   ui_section "下载最新脚本"
   curl -fsSL "$SCRIPT_RAW_URL" -o "$tmp_file" || {
@@ -1039,6 +1004,12 @@ update_script() {
     exit 1
   fi
 
+  if ! sh -n "$tmp_file" 2>/dev/null; then
+    rm -f "$tmp_file"
+    ui_error "更新失败：下载脚本语法检查未通过，已取消替换。"
+    exit 1
+  fi
+
   chmod +x "$tmp_file"
   mv "$tmp_file" "$CLI_PATH"
   ui_success "脚本更新完成。重新输入 mh 可打开新版管理面板。"
@@ -1046,8 +1017,7 @@ update_script() {
 
 uninstall_all() {
   need_root
-  clear 2>/dev/null || true
-  ui_title "彻底卸载脚本"
+  screen_title "彻底卸载脚本"
   ui_warn "将停止服务，并删除 mihomo 内核、配置目录、日志目录和 mh 命令。"
   ui_prompt "确认卸载 mihomo、删除配置和 mh 命令？输入 y 确认："
   read -r confirm || true
