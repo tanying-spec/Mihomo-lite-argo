@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -13,6 +13,8 @@ LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 MIHOMO_GOMEMLIMIT="${MIHOMO_GOMEMLIMIT:-256MiB}"
 MIHOMO_GOGC="${MIHOMO_GOGC:-100}"
+HY2_UP_MBPS=10000
+HY2_DOWN_MBPS=10000
 GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/releases/latest}"
 SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/mh.sh}"
 
@@ -373,6 +375,8 @@ EOF
       "$cfg_node_name": "$cfg_node_password"
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
+    up: ${HY2_UP_MBPS} Mbps
+    down: ${HY2_DOWN_MBPS} Mbps
 EOF
           if [ -n "$cfg_salamander_password" ]; then
             cat >> "$tmp_file" <<EOF
@@ -646,11 +650,11 @@ node_share_link() {
       sni="$value2"
       salamander_password="$value5"
       if [ -n "$salamander_password" ]; then
-        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&obfs=salamander&obfs-password=%s#%s\n' \
-          "$node_password" "$server_ip" "$node_port" "$sni" "$salamander_password" "$link_name"
+        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&upmbps=%s&downmbps=%s&obfs=salamander&obfs-password=%s#%s\n' \
+          "$node_password" "$server_ip" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$salamander_password" "$link_name"
       else
-        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s#%s\n' \
-          "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+        printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&upmbps=%s&downmbps=%s#%s\n' \
+          "$node_password" "$server_ip" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$link_name"
       fi
       ;;
     anytls)
@@ -730,7 +734,7 @@ add_hysteria2_node() {
   [ -n "$node_password" ] || node_password="$default_password"
   node_password="$(printf '%s' "$node_password" | tr -cd 'A-Za-z0-9._~-')"
   [ -n "$node_password" ] || node_password="$default_password"
-  ui_prompt "是否开启 Salamander 混淆？[y/N]："
+  ui_prompt "是否开启 Salamander 混淆？会增加 CPU 占用，低配机器建议关闭 [y/N]："
   read -r enable_salamander || true
   salamander_password=""
   case "$enable_salamander" in

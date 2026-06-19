@@ -1,5 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.1.1
-
+# ✨ Mihomo Lite - 一键配置脚本 V1.2.0
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -39,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 生成节点功能目前内置了以下主流且高效的协议组合：
 
 1.  **VLESS + Reality** 
-2.  **Hysteria2** 
+2.  **Hysteria2**（上下行固定为 10Gbps）
 3.  **AnyTLS**
 4.  **VLESS + WebSocket**
 
@@ -68,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * 默认日志级别为 `warning`，减少高流量时的日志开销。
 * 服务默认注入 `GOMEMLIMIT=256MiB` 和 `GOGC=100`，可在安装或重启前通过环境变量覆盖。
 
-出现断流时时可放宽 GC 限制并重写服务：
+出现断流问题时可放宽 GC 限制并重写服务：
 
 ```sh
 MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
