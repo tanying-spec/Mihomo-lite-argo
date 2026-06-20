@@ -408,6 +408,7 @@ EOF
     type: vless
     port: $cfg_node_port
     listen: 0.0.0.0
+    allow-insecure: true
     users:
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
