@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -699,6 +699,54 @@ unique_port() {
   done
 }
 
+country_profile() {
+  country="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$country" in
+    cn|china|中国|中國) printf '🇨🇳|China' ;;
+    hk|hongkong|hong\ kong|香港) printf '🇭🇰|Hong Kong' ;;
+    tw|taiwan|台湾|台灣) printf '🇹🇼|Taiwan' ;;
+    jp|japan|日本) printf '🇯🇵|Japan' ;;
+    kr|korea|south\ korea|韩国|韓國|南韩|南韓) printf '🇰🇷|South Korea' ;;
+    sg|singapore|新加坡) printf '🇸🇬|Singapore' ;;
+    us|usa|united\ states|america|美国|美國) printf '🇺🇸|United States' ;;
+    uk|gb|united\ kingdom|britain|英国|英國) printf '🇬🇧|United Kingdom' ;;
+    de|germany|德国|德國) printf '🇩🇪|Germany' ;;
+    fr|france|法国|法國) printf '🇫🇷|France' ;;
+    nl|netherlands|荷兰|荷蘭) printf '🇳🇱|Netherlands' ;;
+    ch|switzerland|瑞士) printf '🇨🇭|Switzerland' ;;
+    it|italy|意大利) printf '🇮🇹|Italy' ;;
+    es|spain|西班牙) printf '🇪🇸|Spain' ;;
+    se|sweden|瑞典) printf '🇸🇪|Sweden' ;;
+    ca|canada|加拿大) printf '🇨🇦|Canada' ;;
+    au|australia|澳大利亚|澳洲|澳大利亞) printf '🇦🇺|Australia' ;;
+    ru|russia|俄罗斯|俄羅斯) printf '🇷🇺|Russia' ;;
+    ae|uae|united\ arab\ emirates|阿联酋|阿聯酋) printf '🇦🇪|United Arab Emirates' ;;
+    in|india|印度) printf '🇮🇳|India' ;;
+    br|brazil|巴西) printf '🇧🇷|Brazil' ;;
+    tr|turkey|土耳其) printf '🇹🇷|Turkey' ;;
+    th|thailand|泰国|泰國) printf '🇹🇭|Thailand' ;;
+    vn|vietnam|越南) printf '🇻🇳|Vietnam' ;;
+    my|malaysia|马来西亚|馬來西亞) printf '🇲🇾|Malaysia' ;;
+    id|indonesia|印度尼西亚|印尼|印度尼西亞) printf '🇮🇩|Indonesia' ;;
+    ph|philippines|菲律宾|菲律賓) printf '🇵🇭|Philippines' ;;
+    *) return 1 ;;
+  esac
+}
+
+protocol_label() {
+  case "$1" in
+    vless-reality) printf 'Reality' ;;
+    hysteria2) printf 'Hysteria2' ;;
+    anytls) printf 'AnyTLS' ;;
+    vless-ws) printf 'VLESS-WS' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+sanitize_label() {
+  printf '%s' "$1" | tr -d '|/'
+}
+
 node_share_link() {
   proto="$1"
   node_name="$2"
@@ -911,6 +959,82 @@ add_combo_nodes() {
   print_node_link vless-reality "$reality_name" "$reality_port" "$reality_uuid" "$sni" "$reality_dest" "$reality_private_key" "$reality_public_key" "$reality_short_id"
   print_node_link hysteria2 "$hy2_name" "$hy2_port" "$hy2_password" "$sni" "$hy2_cert_file" "$hy2_key_file" "" ""
   print_node_link anytls "$anytls_name" "$anytls_port" "$anytls_password" "$sni" "$anytls_cert_file" "$anytls_key_file" "" ""
+}
+
+rename_all_nodes() {
+  need_root
+  ensure_installed
+  screen_title "一键重命名所有节点"
+
+  if [ ! -s "$NODES_DB" ]; then
+    ui_warn "当前没有节点。"
+    return 0
+  fi
+
+  ui_prompt "请输入国家/地区（如 Japan、日本、US、美国）："
+  read -r country_input || true
+  country_input="$(sanitize_label "$country_input")"
+  if [ -z "$country_input" ]; then
+    ui_error "国家/地区不能为空。"
+    exit 1
+  fi
+
+  country_info="$(country_profile "$country_input" || true)"
+  if [ -n "$country_info" ]; then
+    country_emoji="${country_info%%|*}"
+    country_name="${country_info#*|}"
+  else
+    ui_prompt "未识别该国家，请手动输入国家旗帜 Emoji："
+    read -r country_emoji || true
+    country_name="$country_input"
+    if [ -z "$country_emoji" ]; then
+      ui_error "国家旗帜 Emoji 不能为空。"
+      exit 1
+    fi
+  fi
+
+  ui_prompt "请输入服务商名称："
+  read -r provider || true
+  provider="$(sanitize_label "$provider")"
+  if [ -z "$provider" ]; then
+    ui_error "服务商名称不能为空。"
+    exit 1
+  fi
+
+  tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
+  reality_count=0
+  hy2_count=0
+  anytls_count=0
+  ws_count=0
+  while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
+    [ -n "$proto" ] || continue
+    case "$proto" in
+      vless-reality|hysteria2|anytls|vless-ws)
+        proto_name="$(protocol_label "$proto")"
+        case "$proto" in
+          vless-reality) reality_count=$((reality_count + 1)); proto_count="$reality_count" ;;
+          hysteria2) hy2_count=$((hy2_count + 1)); proto_count="$hy2_count" ;;
+          anytls) anytls_count=$((anytls_count + 1)); proto_count="$anytls_count" ;;
+          vless-ws) ws_count=$((ws_count + 1)); proto_count="$ws_count" ;;
+        esac
+        new_name="${country_emoji}${country_name}-${provider}-${proto_name}"
+        if [ "$proto_count" -gt 1 ]; then
+          new_name="${new_name}-${proto_count}"
+        fi
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+          "$proto" "$new_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6" >> "$tmp_file"
+        ;;
+      *)
+        printf '%s\n' "$proto" >> "$tmp_file"
+        ;;
+    esac
+  done < "$NODES_DB"
+
+  mv "$tmp_file" "$NODES_DB"
+  chmod 600 "$NODES_DB"
+  render_config
+  restart_service
+  ui_success "所有节点已按 ${country_emoji}${country_name}-${provider}-协议 格式重命名。"
 }
 
 add_node() {
@@ -1196,22 +1320,25 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}1.${C_RESET} 一键生成代理节点
    ${C_GREEN}2.${C_RESET} 查看所有节点链接
    ${C_GREEN}3.${C_RESET} 删除特定节点
-   ${C_GREEN}22.${C_RESET} 一键生成 Reality + Hysteria2 + AnyTLS
 
- ${C_YELLOW}[+] 核心管理${C_RESET}
+  ${C_YELLOW}[+] 核心管理${C_RESET}
    ${C_GREEN}4.${C_RESET} 一键安装 Mihomo 内核
    ${C_GREEN}5.${C_RESET} 更新管理脚本
    ${C_GREEN}6.${C_RESET} 彻底卸载脚本
    
- ${C_YELLOW}[+] 服务运维${C_RESET}
+  ${C_YELLOW}[+] 服务运维${C_RESET}
    ${C_GREEN}7.${C_RESET} 查看 YAML 配置文件
    ${C_GREEN}8.${C_RESET} 重启 Mihomo 服务
    ${C_GREEN}9.${C_RESET} 查看服务实时日志
+
+  ${C_YELLOW}[+] 其他功能${C_RESET}
+   ${C_GREEN}22.${C_RESET} 一键生成 Reality + Hysteria2 + AnyTLS
+   ${C_GREEN}33.${C_RESET} 一键重命名所有节点
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    printf "${C_BOLD}请输入数字选择 (0-9/22)：${C_RESET}"
+    printf "${C_BOLD}请输入数字选择 (0-9/22/33)：${C_RESET}"
     read -r choice || exit 0
 
     case "$choice" in
@@ -1225,8 +1352,9 @@ EOF
       8) need_root; ensure_installed; clear 2>/dev/null || true; ui_title "重启 Mihomo 服务"; restart_service; ui_success "服务已重启。"; pause ;;
       9) show_logs ;;
       22) add_combo_nodes; pause ;;
+      33) rename_all_nodes; pause ;;
       0) clear; exit 0 ;;
-      *) ui_error "无效选择，请输入 0-9 或 22。"; pause ;;
+      *) ui_error "无效选择，请输入 0-9、22 或 33。"; pause ;;
     esac
   done
 }
@@ -1235,6 +1363,7 @@ case "${1:-}" in
   install) install_core ;;
   add) add_node ;;
   combo|batch|22) add_combo_nodes ;;
+  rename|rename-all|33) rename_all_nodes ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;
   delete|del|remove) delete_node ;;

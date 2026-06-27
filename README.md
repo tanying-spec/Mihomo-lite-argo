@@ -27,8 +27,8 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 通过终端输入 `mh` 即可打开 TUI 菜单，支持以下快捷操作：
 
 * **📦 核心管理**：一键安装 / 卸载 Mihomo 内核至系统目录。
-* **🔗 节点生成**：一键生成代理节点，并自动输出可复制导入的节点链接
-* **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除和一键清空。
+* **🔗 节点生成**：一键生成代理节点，并自动输出可复制导入的节点链接。
+* **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除、一键清空和批量重命名。
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
@@ -42,7 +42,9 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 3.  **AnyTLS**
 4.  **VLESS + WebSocket**
 
-批量生成会使用默认 SNI `www.amd.com`，自动避开已存在的节点名和端口，并在最后统一重启服务。
+菜单输入 `22` 可批量生成 Reality + Hysteria2 + AnyTLS，默认 SNI 为 `www.amd.com`，自动避开已存在的节点名和端口，并在最后统一重启服务。
+
+菜单输入 `33` 可批量重命名所有节点，格式为 `国家旗帜Emoji国家全称-服务商名称-节点协议`，国家旗帜会根据输入的国家自动识别。
 
 ---
 
