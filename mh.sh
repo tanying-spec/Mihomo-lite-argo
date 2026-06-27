@@ -282,7 +282,7 @@ base64_one_line() {
 
 create_reality_keypair() {
   need_openssl
-  key_file="$CONFIG_DIR/reality.key.$$"
+  key_file="$(make_temp "$CONFIG_DIR/reality.key.XXXXXX")"
   openssl genpkey -algorithm X25519 -out "$key_file" >/dev/null 2>&1 || {
     rm -f "$key_file"
     red "生成 Reality X25519 密钥失败。"
@@ -345,7 +345,7 @@ public_ip() {
 
 render_config() {
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
-  tmp_file="$CONFIG_FILE.tmp"
+  tmp_file="$(make_temp "$CONFIG_DIR/config.XXXXXX")"
   secret_file="$CONFIG_DIR/controller.secret"
 
   if [ ! -s "$secret_file" ]; then
@@ -1007,6 +1007,7 @@ rename_all_nodes() {
   anytls_count=0
   ws_count=0
   while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
+    db_line="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")"
     [ -n "$proto" ] || continue
     case "$proto" in
       vless-reality|hysteria2|anytls|vless-ws)
@@ -1025,7 +1026,7 @@ rename_all_nodes() {
           "$proto" "$new_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6" >> "$tmp_file"
         ;;
       *)
-        printf '%s\n' "$proto" >> "$tmp_file"
+        printf '%s\n' "$db_line" >> "$tmp_file"
         ;;
     esac
   done < "$NODES_DB"

@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.3.0
+# ✨ Mihomo Lite - 一键配置脚本 V1.5.0
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -20,6 +20,9 @@
 ```sh
 curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install.sh | sudo sh
 ```
+
+安装完成后输入 `mh` 打开菜单，再选择 `4` 安装 / 更新 Mihomo 内核。
+
 ---
 
 ## 🌟 核心功能
