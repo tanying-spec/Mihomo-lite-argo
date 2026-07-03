@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -12,10 +12,13 @@ NODES_DB="$CONFIG_DIR/nodes.db"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
+NETWORK_ENV_FILE="$CONFIG_DIR/network.env"
 PUBLIC_IP_CACHE_FILE="$CONFIG_DIR/public.ip"
 SYSCTL_CONF_FILE="/etc/sysctl.d/99-mihomo-lite.conf"
 MIHOMO_GOMEMLIMIT="${MIHOMO_GOMEMLIMIT:-}"
 MIHOMO_GOGC="${MIHOMO_GOGC:-}"
+MIHOMO_IPV6="${MIHOMO_IPV6:-}"
+MIHOMO_PREFER_IPV6="${MIHOMO_PREFER_IPV6:-}"
 HY2_UP_MBPS=10000
 HY2_DOWN_MBPS=10000
 GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/releases/latest}"
@@ -235,6 +238,49 @@ prompt_runtime_tuning() {
   write_runtime_tuning
 }
 
+bool_value() {
+  case "${1:-}" in
+    1|y|Y|yes|YES|true|TRUE|on|ON|enable|ENABLE|enabled|ENABLED) printf 'true' ;;
+    *) printf 'false' ;;
+  esac
+}
+
+load_network_settings() {
+  if [ -r "$NETWORK_ENV_FILE" ]; then
+    while IFS='=' read -r network_key network_value; do
+      case "$network_key" in
+        MIHOMO_IPV6)
+          [ -n "$MIHOMO_IPV6" ] || MIHOMO_IPV6="$network_value"
+          ;;
+        MIHOMO_PREFER_IPV6)
+          [ -n "$MIHOMO_PREFER_IPV6" ] || MIHOMO_PREFER_IPV6="$network_value"
+          ;;
+      esac
+    done < "$NETWORK_ENV_FILE"
+  fi
+
+  MIHOMO_IPV6="$(bool_value "${MIHOMO_IPV6:-false}")"
+  MIHOMO_PREFER_IPV6="$(bool_value "${MIHOMO_PREFER_IPV6:-false}")"
+}
+
+write_network_settings() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'MIHOMO_IPV6=%s\n' "$MIHOMO_IPV6"
+    printf 'MIHOMO_PREFER_IPV6=%s\n' "$MIHOMO_PREFER_IPV6"
+  } > "$NETWORK_ENV_FILE"
+  chmod 600 "$NETWORK_ENV_FILE"
+}
+
+listener_address() {
+  load_network_settings
+  if [ "$MIHOMO_IPV6" = "true" ]; then
+    printf '::'
+  else
+    printf '0.0.0.0'
+  fi
+}
+
 detect_arch() {
   machine="$(uname -m)"
   case "$machine" in
@@ -300,6 +346,11 @@ new_uuid() {
 url_path() {
   value="${1:-node}"
   printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/\//%2F/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g'
+}
+
+url_query() {
+  value="${1:-}"
+  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g; s/\[/%5B/g; s/\]/%5D/g; s/:/%3A/g'
 }
 
 need_openssl() {
@@ -378,46 +429,183 @@ is_ipv4() {
   '
 }
 
-fetch_public_ip() {
+is_ipv6() {
+  case "$1" in
+    *:*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$1" | awk '
+    {
+      if ($0 !~ /^[0-9A-Fa-f:]+$/) exit 1
+      value = $0
+      double_colon = gsub(/::/, "", value)
+      if (double_colon > 1 || $0 ~ /:::/) exit 1
+      split($0, parts, ":")
+      nonempty = 0
+      for (i in parts) {
+        if (parts[i] != "") {
+          if (length(parts[i]) > 4) exit 1
+          nonempty++
+        }
+      }
+      if (double_colon == 1 && nonempty <= 7) exit 0
+      if (double_colon == 0 && nonempty == 8) exit 0
+      exit 1
+    }
+  '
+}
+
+is_ip_address() {
+  is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+format_link_host() {
+  if is_ipv6 "$1"; then
+    printf '[%s]' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+fetch_public_ipv4() {
   command -v curl >/dev/null 2>&1 || return 1
-  ip="$(curl -4 -fsSL https://api.ipify.org 2>/dev/null || true)"
+  ip="$(curl -4 -m 4 -fsSL https://api.ipify.org 2>/dev/null || true)"
   if [ -z "$ip" ]; then
-    ip="$(curl -4 -fsSL https://ifconfig.me 2>/dev/null || true)"
+    ip="$(curl -4 -m 4 -fsSL https://ifconfig.me 2>/dev/null || true)"
   fi
   ip="$(printf '%s' "$ip" | tr -d '[:space:]')"
   is_ipv4 "$ip" || return 1
   printf '%s' "$ip"
 }
 
-public_ip() {
-  cached_ip=""
+fetch_public_ipv6() {
+  command -v curl >/dev/null 2>&1 || return 1
+  ip="$(curl -6 -m 4 -fsSL https://api6.ipify.org 2>/dev/null || true)"
+  if [ -z "$ip" ]; then
+    ip="$(curl -6 -m 4 -fsSL https://ifconfig.me 2>/dev/null || true)"
+  fi
+  ip="$(printf '%s' "$ip" | tr -d '[:space:]')"
+  is_ipv6 "$ip" || return 1
+  printf '%s' "$ip"
+}
+
+cached_public_ip() {
+  cache_family="$1"
+  cache_ip=""
   if [ -r "$PUBLIC_IP_CACHE_FILE" ]; then
-    cached_ip="$(sed -n '1p' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
-    if is_ipv4 "$cached_ip"; then
-      printf '%s' "$cached_ip"
+    cache_ip="$(awk -F= -v family="$cache_family" '$1 == family { value = $2 } END { print value }' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$cache_ip" ]; then
+      case "$cache_family" in
+        ipv6) is_ipv6 "$cache_ip" || return 1 ;;
+        *) is_ipv4 "$cache_ip" || return 1 ;;
+      esac
+      printf '%s' "$cache_ip"
       return 0
     fi
+
+    cache_ip="$(sed -n '1p' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    case "$cache_family" in
+      ipv6) is_ipv6 "$cache_ip" || return 1 ;;
+      *) is_ipv4 "$cache_ip" || return 1 ;;
+    esac
+    printf '%s' "$cache_ip"
+    return 0
+  fi
+  return 1
+}
+
+cache_public_ip() {
+  cache_family="$1"
+  cache_ip="$2"
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  if [ ! -w "$CONFIG_DIR" ] && [ ! -w "$PUBLIC_IP_CACHE_FILE" ]; then
+    return 0
   fi
 
-  if ip="$(fetch_public_ip 2>/dev/null)"; then
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    if [ -w "$CONFIG_DIR" ] || [ -w "$PUBLIC_IP_CACHE_FILE" ]; then
-      printf '%s\n' "$ip" > "$PUBLIC_IP_CACHE_FILE" 2>/dev/null || true
-      chmod 600 "$PUBLIC_IP_CACHE_FILE" 2>/dev/null || true
-    fi
+  tmp_file="$(make_temp "$CONFIG_DIR/public-ip.XXXXXX")"
+  if [ -r "$PUBLIC_IP_CACHE_FILE" ]; then
+    awk -F= -v family="$cache_family" '$1 != family && $1 ~ /^ipv[46]$/ { print }' "$PUBLIC_IP_CACHE_FILE" > "$tmp_file" 2>/dev/null || : > "$tmp_file"
+  else
+    : > "$tmp_file"
+  fi
+  printf '%s=%s\n' "$cache_family" "$cache_ip" >> "$tmp_file"
+  mv "$tmp_file" "$PUBLIC_IP_CACHE_FILE"
+  chmod 600 "$PUBLIC_IP_CACHE_FILE"
+}
+
+local_ip_by_family() {
+  local_family="$1"
+  hostname -I 2>/dev/null | tr ' ' '\n' | awk -v family="$local_family" '
+    family == "ipv6" && index($0, ":") > 0 { print; exit }
+    family != "ipv6" && index($0, ":") == 0 && $0 != "" { print; exit }
+  '
+}
+
+public_ip_by_family() {
+  ip_family="$1"
+
+  if ip="$(cached_public_ip "$ip_family" 2>/dev/null)"; then
     printf '%s' "$ip"
     return 0
   fi
 
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  if [ -z "$ip" ]; then
-    ip="YOUR_SERVER_IP"
+  case "$ip_family" in
+    ipv6)
+      if ip="$(fetch_public_ipv6 2>/dev/null)"; then
+        cache_public_ip ipv6 "$ip"
+        printf '%s' "$ip"
+        return 0
+      fi
+      ip="$(local_ip_by_family ipv6)"
+      ;;
+    *)
+      if ip="$(fetch_public_ipv4 2>/dev/null)"; then
+        cache_public_ip ipv4 "$ip"
+        printf '%s' "$ip"
+        return 0
+      fi
+      ip="$(local_ip_by_family ipv4)"
+      ;;
+  esac
+
+  if is_ip_address "$ip"; then
+    printf '%s' "$ip"
+    return 0
   fi
-  printf '%s' "$ip"
+  return 1
+}
+
+public_ip() {
+  load_network_settings
+
+  if [ "$MIHOMO_PREFER_IPV6" = "true" ]; then
+    if ip="$(public_ip_by_family ipv6 2>/dev/null)"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+    if ip="$(public_ip_by_family ipv4 2>/dev/null)"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  else
+    if ip="$(public_ip_by_family ipv4 2>/dev/null)"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+    if [ "$MIHOMO_IPV6" = "true" ] && ip="$(public_ip_by_family ipv6 2>/dev/null)"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  fi
+
+  printf 'YOUR_SERVER_IP'
 }
 
 render_config() {
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+  load_network_settings
+  cfg_ipv6="$MIHOMO_IPV6"
+  cfg_listen_address="$(listener_address)"
   tmp_file="$(make_temp "$CONFIG_DIR/config.XXXXXX")"
   secret_file="$CONFIG_DIR/controller.secret"
 
@@ -433,7 +621,7 @@ allow-lan: false
 bind-address: 127.0.0.1
 mode: rule
 log-level: warning
-ipv6: false
+ipv6: $cfg_ipv6
 external-controller: 127.0.0.1:9090
 secret: "$controller_secret"
 profile:
@@ -442,12 +630,19 @@ profile:
 dns:
   enable: true
   listen: 127.0.0.1:1053
-  ipv6: false
+  ipv6: $cfg_ipv6
   enhanced-mode: redir-host
   nameserver:
     - 1.1.1.1
     - 8.8.8.8
 EOF
+
+  if [ "$cfg_ipv6" = "true" ]; then
+    cat >> "$tmp_file" <<'EOF'
+    - 2606:4700:4700::1111
+    - 2001:4860:4860::8888
+EOF
+  fi
 
   if [ -s "$NODES_DB" ]; then
     printf 'listeners:\n' >> "$tmp_file"
@@ -464,7 +659,7 @@ EOF
   - name: "$cfg_node_name"
     type: vless
     port: $cfg_node_port
-    listen: 0.0.0.0
+    listen: "$cfg_listen_address"
     users:
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
@@ -487,7 +682,7 @@ EOF
   - name: "$cfg_node_name"
     type: hysteria2
     port: $cfg_node_port
-    listen: 0.0.0.0
+    listen: "$cfg_listen_address"
     users:
       "$cfg_node_name": "$cfg_node_password"
     certificate: "$cfg_cert_file"
@@ -510,7 +705,7 @@ EOF
   - name: "$cfg_node_name"
     type: anytls
     port: $cfg_node_port
-    listen: 0.0.0.0
+    listen: "$cfg_listen_address"
     users:
       "$cfg_node_name": "$cfg_node_password"
     certificate: "$cfg_cert_file"
@@ -524,7 +719,7 @@ EOF
   - name: "$cfg_node_name"
     type: vless
     port: $cfg_node_port
-    listen: 0.0.0.0
+    listen: "$cfg_listen_address"
     allow-insecure: true
     users:
       - username: "$cfg_node_name"
@@ -832,6 +1027,7 @@ node_share_link() {
   value5="${8:-}"
   value6="${9:-}"
   server_ip="${SHARE_SERVER_IP:-$(public_ip)}"
+  server_host="$(format_link_host "$server_ip")"
   link_name="$(url_path "$node_name")"
 
   case "$proto" in
@@ -841,7 +1037,7 @@ node_share_link() {
       public_key="$value5"
       short_id="$value6"
       printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
-        "$node_uuid" "$server_ip" "$node_port" "$sni" "$public_key" "$short_id" "$link_name"
+        "$node_uuid" "$server_host" "$node_port" "$sni" "$public_key" "$short_id" "$link_name"
       ;;
     hysteria2)
       node_password="$value1"
@@ -849,24 +1045,25 @@ node_share_link() {
       salamander_password="$value5"
       if [ -n "$salamander_password" ]; then
         printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&upmbps=%s&downmbps=%s&obfs=salamander&obfs-password=%s#%s\n' \
-          "$node_password" "$server_ip" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$salamander_password" "$link_name"
+          "$node_password" "$server_host" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$salamander_password" "$link_name"
       else
         printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&upmbps=%s&downmbps=%s#%s\n' \
-          "$node_password" "$server_ip" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$link_name"
+          "$node_password" "$server_host" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$link_name"
       fi
       ;;
     anytls)
       node_password="$value1"
       sni="$value2"
       printf 'anytls://%s@%s:%s?insecure=1&sni=%s#%s\n' \
-        "$node_password" "$server_ip" "$node_port" "$sni" "$link_name"
+        "$node_password" "$server_host" "$node_port" "$sni" "$link_name"
       ;;
     vless-ws)
       node_uuid="$value1"
       ws_path="$(url_path "$value2")"
-      ws_host="${value3:-$server_ip}"
+      ws_host="${value3:-$server_host}"
+      ws_host_query="$(url_query "$ws_host")"
       printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#%s\n' \
-        "$node_uuid" "$server_ip" "$node_port" "$ws_host" "$ws_path" "$link_name"
+        "$node_uuid" "$server_host" "$node_port" "$ws_host_query" "$ws_path" "$link_name"
       ;;
   esac
 }
@@ -1487,6 +1684,101 @@ optimize_sysctl_network() {
   fi
 }
 
+ipv6_settings_menu() {
+  need_root
+  ensure_installed
+  load_network_settings
+  current_listen="$(listener_address)"
+  if [ "$MIHOMO_IPV6" = "true" ]; then
+    current_ipv6="已开启"
+  else
+    current_ipv6="已关闭"
+  fi
+  if [ "$MIHOMO_PREFER_IPV6" = "true" ]; then
+    current_share="优先 IPv6"
+  else
+    current_share="优先 IPv4"
+  fi
+
+  screen_title "IPv6 支持设置"
+  cat <<EOF
+ 当前状态：IPv6 $current_ipv6，分享链接 $current_share，监听地址 $current_listen
+${C_CYAN}----------------------------------------------------${C_RESET}
+ ${C_GREEN}1.${C_RESET} 关闭 IPv6，恢复 IPv4 监听
+ ${C_GREEN}2.${C_RESET} 开启 IPv6 监听，分享链接继续优先 IPv4
+ ${C_GREEN}3.${C_RESET} 开启 IPv6 监听，分享链接优先 IPv6
+ ${C_GREEN}4.${C_RESET} 手动设置分享 IP（IPv4 或 IPv6）
+ ${C_GREEN}5.${C_RESET} 刷新公网 IP 缓存
+ ${C_GREEN}0.${C_RESET} => 返回主菜单
+${C_CYAN}====================================================${C_RESET}
+EOF
+  ui_prompt "请输入数字选择 (0-5)："
+  read -r ipv6_choice || true
+
+  case "$ipv6_choice" in
+    1)
+      MIHOMO_IPV6="false"
+      MIHOMO_PREFER_IPV6="false"
+      write_network_settings
+      render_config
+      restart_service
+      ui_success "已关闭 IPv6，监听地址恢复为 0.0.0.0。"
+      ;;
+    2)
+      MIHOMO_IPV6="true"
+      MIHOMO_PREFER_IPV6="false"
+      write_network_settings
+      render_config
+      restart_service
+      ui_success "已开启 IPv6 监听，分享链接继续优先使用 IPv4。"
+      ;;
+    3)
+      MIHOMO_IPV6="true"
+      MIHOMO_PREFER_IPV6="true"
+      write_network_settings
+      render_config
+      restart_service
+      ui_success "已开启 IPv6 监听，分享链接将优先使用 IPv6。"
+      ;;
+    4)
+      ui_prompt "请输入要写入分享链接的公网 IP（IPv4 或 IPv6）："
+      read -r manual_ip || true
+      manual_ip="$(printf '%s' "$manual_ip" | tr -d '[:space:]')"
+      if is_ipv6 "$manual_ip"; then
+        MIHOMO_IPV6="true"
+        MIHOMO_PREFER_IPV6="true"
+        write_network_settings
+        cache_public_ip ipv6 "$manual_ip"
+        render_config
+        restart_service
+        ui_success "已保存 IPv6 分享地址：$manual_ip。"
+      elif is_ipv4 "$manual_ip"; then
+        MIHOMO_PREFER_IPV6="false"
+        write_network_settings
+        cache_public_ip ipv4 "$manual_ip"
+        render_config
+        restart_service
+        ui_success "已保存 IPv4 分享地址：$manual_ip。"
+      else
+        ui_error "IP 地址格式无效。"
+        return 1
+      fi
+      ;;
+    5)
+      rm -f "$PUBLIC_IP_CACHE_FILE"
+      ui_success "公网 IP 缓存已清空，下次查看或生成节点时会重新获取。"
+      ;;
+    0)
+      ui_warn "已取消 IPv6 设置。"
+      return 0
+      ;;
+    *)
+      ui_error "无效选择。"
+      return 1
+      ;;
+  esac
+}
+
 update_script() {
   need_root
   ensure_curl
@@ -1584,11 +1876,12 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}33.${C_RESET} 一键重命名所有节点
    ${C_GREEN}44.${C_RESET} 性能优化菜单
    ${C_GREEN}55.${C_RESET} sysctl 网络优化
+   ${C_GREEN}66.${C_RESET} IPv6 支持设置
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    printf "${C_BOLD}请输入数字选择 (0-9/22/33/44/55)：${C_RESET}"
+    printf "${C_BOLD}请输入数字选择 (0-9/22/33/44/55/66)：${C_RESET}"
     read -r choice || exit 0
 
     case "$choice" in
@@ -1605,8 +1898,9 @@ EOF
       33) rename_all_nodes; pause ;;
       44) performance_tuning_menu; pause ;;
       55) optimize_sysctl_network; pause ;;
+      66) ipv6_settings_menu; pause ;;
       0) clear; exit 0 ;;
-      *) ui_error "无效选择，请输入 0-9、22、33、44 或 55。"; pause ;;
+      *) ui_error "无效选择，请输入 0-9、22、33、44、55 或 66。"; pause ;;
     esac
   done
 }
@@ -1618,6 +1912,7 @@ case "${1:-}" in
   rename|rename-all|33) rename_all_nodes ;;
   perf|performance|tune|44) performance_tuning_menu ;;
   sysctl|netopt|55) optimize_sysctl_network ;;
+  ipv6|ip6|66) ipv6_settings_menu ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;
   delete|del|remove) delete_node ;;

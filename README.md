@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.6.0
+# ✨ Mihomo Lite - 一键配置脚本 V1.7.0
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -34,6 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除、一键清空和批量重命名。
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **🚀 性能优化**：支持运行时参数调优、sysctl 网络优化和公网 IP 本地缓存。
+* **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
 
@@ -54,6 +55,8 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 
 菜单输入 `55` 可尝试应用 sysctl 网络优化，包括 BBR、队列、TCP/UDP 缓冲和本地端口范围。LXC 容器可能无法写入部分参数，脚本会自动跳过无权限项目。
 
+菜单输入 `66` 可配置 IPv6 支持：关闭 IPv6、开启 IPv6 监听但继续分享 IPv4、开启并优先分享 IPv6、手动指定分享 IP 或刷新公网 IP 缓存。
+
 ---
 
 ## 📂 目录与服务架构
@@ -68,7 +71,8 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 | **主配置文件** | `/etc/mihomo/config.yaml` | Mihomo 运行的源配置 |
 | **节点数据库** | `/etc/mihomo/nodes.db` | 本地化存储已生成的节点记录 |
 | **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT` 与 `GOGC` |
-| **公网 IP 缓存** | `/etc/mihomo/public.ip` | 生成节点链接时优先读取，减少外部 API 请求 |
+| **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
+| **公网 IP 缓存** | `/etc/mihomo/public.ip` | 缓存 IPv4 / IPv6 分享地址，减少外部 API 请求 |
 | **日志目录** | `/var/log/mihomo/` | 存储服务的运行与连接日志 |
 
 *💡 后台守护服务名称：`mihomo`*
@@ -93,3 +97,13 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
 如果容器内存极低并且仍然崩溃，可再收紧到 `128MiB/50` 或 `192MiB/75`。
 
 节点链接里的公网 IP 会缓存到 `/etc/mihomo/public.ip`。如果 VPS 更换了出口 IP，删除该文件后重新查看或生成节点即可刷新。
+
+### 🌐 IPv6 使用说明
+
+默认保持 IPv4 兼容模式。需要 IPv6 时，在菜单输入 `66` 开启：
+
+* 选择 `2`：Mihomo 监听 IPv6，节点分享链接仍优先使用 IPv4。
+* 选择 `3`：Mihomo 监听 IPv6，节点分享链接优先使用 IPv6，链接中的 IPv6 地址会自动添加方括号。
+* 选择 `4`：手动写入分享 IP，适合 VPS 有多个 IPv6 或自动识别不准确的情况。
+
+开启 IPv6 后请确认 VPS、LXC 宿主机、防火墙和云厂商安全组均已放行对应端口的 IPv6 入站流量。
