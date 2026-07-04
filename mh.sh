@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="1.9.1"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -2297,17 +2297,26 @@ update_user_traffic_from_iptables() {
       if (NF >= 11 && $11 in delta) user_delta += delta[$11]
       if (user_delta > 0) {
         old = $7 + 0
-        $7 = int(old + user_delta)
+        quota = $6 + 0
+        enabled = $8
+        new_used = int(old + user_delta)
+        if (enabled == "1" && quota > 0 && new_used >= quota) crossed++
+        $7 = new_used
         changed++
       }
     }
     { print }
     END {
-      printf "%d", changed > "/dev/stderr"
+      printf "%d|%d", changed, crossed > "/dev/stderr"
     }
   ' "$tmp_deltas" "$USERS_DB" > "$tmp_users" 2>"$tmp_users.count")"
-  changed_count="$(cat "$tmp_users.count" 2>/dev/null || printf '0')"
+  count_text="$(cat "$tmp_users.count" 2>/dev/null || printf '0|0')"
   rm -f "$tmp_users.count"
+  IFS='|' read -r changed_count quota_crossed_count <<EOF
+$count_text
+EOF
+  changed_count="${changed_count:-0}"
+  quota_crossed_count="${quota_crossed_count:-0}"
 
   if [ "${changed_count:-0}" = "0" ]; then
     mv "$tmp_current" "$TRAFFIC_DB"
@@ -2325,10 +2334,14 @@ update_user_traffic_from_iptables() {
 
   ui_success "已更新 $changed_count 个用户的流量用量。"
   list_multi_users
-  render_config
-  restart_service
-  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
-  ui_success "已根据最新到期时间和流量配额重载服务。"
+  if [ "$quota_crossed_count" != "0" ]; then
+    render_config
+    restart_service
+    refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
+    ui_success "检测到 $quota_crossed_count 个用户达到流量配额，已重载服务并移除对应 listener。"
+  else
+    ui_success "未触发新的配额限制，本次未重启 Mihomo。"
+  fi
 }
 
 update_user_traffic_from_connections() {

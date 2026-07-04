@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.9.0
+# ✨ Mihomo Lite - 一键配置脚本 V1.9.1
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -125,6 +125,7 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
 * 到期、禁用和超出流量配额的用户会在重新渲染配置时自动从独立 listener 中排除。
 * 菜单 `77` -> `8` 会通过 iptables 按用户端口刷新流量统计，也可执行 `mh traffic`。
 * 第一次刷新会建立 `/etc/mihomo/traffic.db` 快照；后续刷新会按用户端口的 TCP + UDP 入站和出站字节增量累加到 `used_bytes`。
+* 刷新流量统计只更新本地数据库，默认不会重启 Mihomo；只有用户达到流量配额、需要移除 listener 时才会重载服务。
 * 用户端口、启停状态、到期/配额或用户列表变化时，脚本会重建 iptables 统计规则并重置流量快照，已累计的 `used_bytes` 不会被清零。
 * 该方案不再依赖 Mihomo `/connections` 是否返回用户字段。LXC 容器需要具备 iptables / NET_ADMIN 权限，否则只能管理用户，无法读取端口流量计数。
 * 菜单 `77` -> `9` 可重置指定用户的已用流量，便于测试配额。
