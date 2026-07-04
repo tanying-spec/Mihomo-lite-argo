@@ -3,22 +3,26 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 NODES_DB="$CONFIG_DIR/nodes.db"
+USERS_DB="$CONFIG_DIR/users.db"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
 NETWORK_ENV_FILE="$CONFIG_DIR/network.env"
+FEATURES_ENV_FILE="$CONFIG_DIR/features.env"
+MULTI_USER_FLAG="$CONFIG_DIR/multi-user.enabled"
 PUBLIC_IP_CACHE_FILE="$CONFIG_DIR/public.ip"
 SYSCTL_CONF_FILE="/etc/sysctl.d/99-mihomo-lite.conf"
 MIHOMO_GOMEMLIMIT="${MIHOMO_GOMEMLIMIT:-}"
 MIHOMO_GOGC="${MIHOMO_GOGC:-}"
 MIHOMO_IPV6="${MIHOMO_IPV6:-}"
 MIHOMO_PREFER_IPV6="${MIHOMO_PREFER_IPV6:-}"
+MIHOMO_MULTI_USER="${MIHOMO_MULTI_USER:-}"
 HY2_UP_MBPS=10000
 HY2_DOWN_MBPS=10000
 GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/releases/latest}"
@@ -279,6 +283,180 @@ listener_address() {
   else
     printf '0.0.0.0'
   fi
+}
+
+load_feature_settings() {
+  if [ -r "$FEATURES_ENV_FILE" ]; then
+    while IFS='=' read -r feature_key feature_value; do
+      case "$feature_key" in
+        MULTI_USER_ENABLED)
+          [ -n "$MIHOMO_MULTI_USER" ] || MIHOMO_MULTI_USER="$feature_value"
+          ;;
+      esac
+    done < "$FEATURES_ENV_FILE"
+  fi
+
+  if [ -f "$MULTI_USER_FLAG" ]; then
+    MIHOMO_MULTI_USER="true"
+  else
+    MIHOMO_MULTI_USER="$(bool_value "${MIHOMO_MULTI_USER:-false}")"
+  fi
+}
+
+write_feature_settings() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'MULTI_USER_ENABLED=%s\n' "$MIHOMO_MULTI_USER"
+  } > "$FEATURES_ENV_FILE"
+  chmod 600 "$FEATURES_ENV_FILE"
+
+  if [ "$MIHOMO_MULTI_USER" = "true" ]; then
+    : > "$MULTI_USER_FLAG"
+    chmod 600 "$MULTI_USER_FLAG"
+  else
+    rm -f "$MULTI_USER_FLAG"
+  fi
+}
+
+multi_user_enabled() {
+  load_feature_settings
+  [ "$MIHOMO_MULTI_USER" = "true" ]
+}
+
+prompt_multi_user_feature() {
+  if [ -x "$BIN_PATH" ] || [ -f "$CONFIG_FILE" ]; then
+    load_feature_settings
+    return 0
+  fi
+
+  if [ -f "$FEATURES_ENV_FILE" ] || [ -f "$MULTI_USER_FLAG" ]; then
+    load_feature_settings
+    return 0
+  fi
+
+  ui_section "可选功能"
+  ui_prompt "是否安装多用户管理面板？仅首次安装时选择 [y/N]："
+  read -r enable_multi_user || true
+  case "$enable_multi_user" in
+    y|Y|yes|YES)
+      MIHOMO_MULTI_USER="true"
+      write_feature_settings
+      : > "$USERS_DB"
+      chmod 600 "$USERS_DB"
+      ui_success "多用户管理面板已启用。"
+      ;;
+    *)
+      MIHOMO_MULTI_USER="false"
+      write_feature_settings
+      ui_warn "未启用多用户管理面板，菜单不会显示 77。"
+      ;;
+  esac
+}
+
+ensure_multi_user_enabled() {
+  if ! multi_user_enabled; then
+    ui_error "多用户管理未启用。该功能只能在初次安装 Mihomo 内核时选择安装。"
+    exit 1
+  fi
+  [ -f "$USERS_DB" ] || : > "$USERS_DB"
+  chmod 600 "$USERS_DB"
+}
+
+today_ymd() {
+  date +%Y-%m-%d
+}
+
+date_to_epoch() {
+  input_date="$1"
+  date -d "$input_date" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$input_date" +%s 2>/dev/null || printf ''
+}
+
+is_valid_date() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$(date_to_epoch "$1")" ]
+}
+
+is_user_active() {
+  user_enabled="$1"
+  user_expire="$2"
+  user_quota="${3:-0}"
+  user_used="${4:-0}"
+  [ "$user_enabled" = "1" ] || return 1
+
+  case "$user_quota" in ''|*[!0-9]*) user_quota=0 ;; esac
+  case "$user_used" in ''|*[!0-9]*) user_used=0 ;; esac
+  if [ "$user_quota" != "0" ] && awk -v used="$user_used" -v quota="$user_quota" 'BEGIN { exit used >= quota ? 0 : 1 }'; then
+    return 1
+  fi
+
+  [ -n "$user_expire" ] || return 0
+  today_epoch="$(date_to_epoch "$(today_ymd)")"
+  expire_epoch="$(date_to_epoch "$user_expire")"
+  [ -n "$today_epoch" ] && [ -n "$expire_epoch" ] || return 1
+  [ "$expire_epoch" -ge "$today_epoch" ]
+}
+
+format_bytes() {
+  bytes="${1:-0}"
+  case "$bytes" in
+    ''|*[!0-9]*) bytes=0 ;;
+  esac
+  awk -v b="$bytes" 'BEGIN {
+    if (b >= 1073741824) printf "%.2fGiB", b / 1073741824;
+    else if (b >= 1048576) printf "%.2fMiB", b / 1048576;
+    else if (b >= 1024) printf "%.2fKiB", b / 1024;
+    else printf "%dB", b;
+  }'
+}
+
+quota_to_bytes() {
+  quota_value="$1"
+  case "$quota_value" in
+    ''|0) printf '0'; return 0 ;;
+    *[!0-9GgMmKk]*)
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$quota_value" | awk '
+    /^[0-9]+$/ { print $1; exit 0 }
+    /^[0-9]+[Gg]$/ { sub(/[Gg]$/, ""); print $1 * 1024 * 1024 * 1024; exit 0 }
+    /^[0-9]+[Mm]$/ { sub(/[Mm]$/, ""); print $1 * 1024 * 1024; exit 0 }
+    /^[0-9]+[Kk]$/ { sub(/[Kk]$/, ""); print $1 * 1024; exit 0 }
+    { exit 1 }
+  '
+}
+
+sanitize_user_field() {
+  printf '%s' "$1" | tr -d '|'
+}
+
+user_name_exists() {
+  user_name="$1"
+  [ -s "$USERS_DB" ] || return 1
+  awk -F'|' -v n="$user_name" '$1 == n { found = 1 } END { exit found ? 0 : 1 }' "$USERS_DB"
+}
+
+node_record_by_index() {
+  node_index="$1"
+  awk -F'|' -v n="$node_index" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      i++
+      if (i == n) { print; exit }
+    }
+  ' "$NODES_DB"
+}
+
+user_record_by_index() {
+  user_index="$1"
+  awk -F'|' -v n="$user_index" '
+    NF >= 9 {
+      i++
+      if (i == n) { print; exit }
+    }
+  ' "$USERS_DB"
 }
 
 detect_arch() {
@@ -601,9 +779,38 @@ public_ip() {
   printf 'YOUR_SERVER_IP'
 }
 
+render_extra_users() {
+  render_node_name="$1"
+  render_proto="$2"
+  render_style="$3"
+
+  [ "$MIHOMO_MULTI_USER" = "true" ] || return 0
+  [ -s "$USERS_DB" ] || return 0
+
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note; do
+    [ "$user_node" = "$render_node_name" ] || continue
+    [ "$user_proto" = "$render_proto" ] || continue
+    is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
+    case "$render_style" in
+      map)
+        cat <<EOF
+      "$user_name": "$user_credential"
+EOF
+        ;;
+      list)
+        cat <<EOF
+      - username: "$user_name"
+        uuid: "$user_credential"
+EOF
+        ;;
+    esac
+  done < "$USERS_DB"
+}
+
 render_config() {
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
   load_network_settings
+  load_feature_settings
   cfg_ipv6="$MIHOMO_IPV6"
   cfg_listen_address="$(listener_address)"
   tmp_file="$(make_temp "$CONFIG_DIR/config.XXXXXX")"
@@ -663,6 +870,9 @@ EOF
     users:
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
+EOF
+          render_extra_users "$cfg_node_name" "$cfg_proto" list >> "$tmp_file"
+          cat >> "$tmp_file" <<EOF
     tls: true
     reality-config:
       dest: "$cfg_dest"
@@ -685,6 +895,9 @@ EOF
     listen: "$cfg_listen_address"
     users:
       "$cfg_node_name": "$cfg_node_password"
+EOF
+          render_extra_users "$cfg_node_name" "$cfg_proto" map >> "$tmp_file"
+          cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
     up: ${HY2_UP_MBPS} Mbps
@@ -708,6 +921,9 @@ EOF
     listen: "$cfg_listen_address"
     users:
       "$cfg_node_name": "$cfg_node_password"
+EOF
+          render_extra_users "$cfg_node_name" "$cfg_proto" map >> "$tmp_file"
+          cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
 EOF
@@ -724,6 +940,9 @@ EOF
     users:
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
+EOF
+          render_extra_users "$cfg_node_name" "$cfg_proto" list >> "$tmp_file"
+          cat >> "$tmp_file" <<EOF
     ws-path: "$cfg_ws_path"
 EOF
           ;;
@@ -819,6 +1038,7 @@ install_core() {
   screen_title "一键安装 Mihomo 内核"
   detect_os
   prompt_runtime_tuning
+  prompt_multi_user_feature
   ui_section "安装系统依赖"
   install_packages curl gzip openssl
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
@@ -844,6 +1064,10 @@ install_core() {
 
   [ -f "$NODES_DB" ] || : > "$NODES_DB"
   chmod 600 "$NODES_DB"
+  if multi_user_enabled; then
+    [ -f "$USERS_DB" ] || : > "$USERS_DB"
+    chmod 600 "$USERS_DB"
+  fi
   render_config
 
   manager="$(service_manager)"
@@ -1479,6 +1703,300 @@ delete_node() {
   ui_success "节点 $deleted 已删除，服务已重启。"
 }
 
+list_multi_users() {
+  if [ ! -s "$USERS_DB" ]; then
+    ui_warn "当前没有多用户记录。"
+    return 1
+  fi
+
+  ui_section "多用户列表"
+  i=1
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note; do
+    [ -n "$user_name" ] || continue
+    if is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used"; then
+      status="启用"
+    elif [ "$user_enabled" = "1" ]; then
+      status="已过期"
+    else
+      status="禁用"
+    fi
+    quota_text="不限"
+    [ "${user_quota:-0}" != "0" ] && quota_text="$(format_bytes "$user_quota")"
+    used_text="$(format_bytes "${user_used:-0}")"
+    printf ' %s%s.%s %s%s%s  node=%s  proto=%s  expire=%s  quota=%s  used=%s  status=%s\n' \
+      "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$user_name" "$C_RESET" "$user_node" "$user_proto" "${user_expire:-never}" "$quota_text" "$used_text" "$status"
+    i=$((i + 1))
+  done < "$USERS_DB"
+}
+
+add_multi_user() {
+  ensure_multi_user_enabled
+  if [ ! -s "$NODES_DB" ]; then
+    ui_warn "当前没有节点，请先创建节点。"
+    return 1
+  fi
+
+  screen_title "添加多用户"
+  list_nodes || return 1
+  ui_prompt "请选择要绑定的节点编号："
+  read -r node_choice || true
+  case "$node_choice" in
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  node_record="$(node_record_by_index "$node_choice")"
+  if [ -z "$node_record" ]; then
+    ui_error "未找到节点编号 $node_choice。"
+    return 1
+  fi
+
+  IFS='|' read -r user_proto user_node_name user_node_port user_value1 user_value2 user_value3 user_value4 user_value5 user_value6 <<EOF
+$node_record
+EOF
+
+  ui_prompt "请输入用户名（英文/数字/下划线，不能重复）："
+  read -r user_name || true
+  user_name="$(printf '%s' "$user_name" | tr -cd 'A-Za-z0-9._-')"
+  if [ -z "$user_name" ]; then
+    ui_error "用户名不能为空。"
+    return 1
+  fi
+  if user_name_exists "$user_name"; then
+    ui_error "用户名 $user_name 已存在。"
+    return 1
+  fi
+
+  ui_prompt "请输入到期日期 YYYY-MM-DD（留空为永不过期）："
+  read -r user_expire || true
+  user_expire="$(sanitize_user_field "$user_expire")"
+  if [ -n "$user_expire" ] && ! is_valid_date "$user_expire"; then
+    ui_error "日期格式无效。"
+    return 1
+  fi
+
+  ui_prompt "请输入流量配额（如 100G / 500M，留空或 0 为不限）："
+  read -r quota_input || true
+  quota_input="$(sanitize_user_field "$quota_input")"
+  if [ -z "$quota_input" ]; then
+    user_quota=0
+  else
+    user_quota="$(quota_to_bytes "$quota_input")" || {
+      ui_error "流量配额格式无效。"
+      return 1
+    }
+  fi
+
+  case "$user_proto" in
+    vless-reality|vless-ws)
+      user_credential="$(new_uuid)"
+      ;;
+    hysteria2|anytls)
+      user_credential="$(rand_alnum 32)"
+      ;;
+    *)
+      ui_error "该节点协议暂不支持多用户。"
+      return 1
+      ;;
+  esac
+
+  user_created="$(today_ymd)"
+  printf '%s|%s|%s|%s|%s|%s|0|1|%s|\n' \
+    "$user_name" "$user_node_name" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "$user_created" >> "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  render_config
+  restart_service
+  ui_success "用户 $user_name 已添加并重载服务。"
+  SHARE_SERVER_IP="$(public_ip)"
+  export SHARE_SERVER_IP
+  print_node_link "$user_proto" "$user_name" "$user_node_port" "$user_credential" "$user_value2" "$user_value3" "$user_value4" "$user_value5" "$user_value6"
+}
+
+delete_multi_user() {
+  ensure_multi_user_enabled
+  screen_title "删除多用户"
+  list_multi_users || return 0
+  ui_prompt "请输入要删除的用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+  user_name="${user_record%%|*}"
+  ui_prompt "确认删除用户 $user_name？输入 y 确认："
+  read -r confirm || true
+  case "$confirm" in
+    y|Y|yes|YES) ;;
+    *) ui_warn "已取消删除。"; return 0 ;;
+  esac
+
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  awk -F'|' -v n="$user_choice" 'NF >= 9 { i++; if (i == n) next } { print }' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  render_config
+  restart_service
+  ui_success "用户 $user_name 已删除并重载服务。"
+}
+
+set_multi_user_enabled_state() {
+  target_enabled="$1"
+  action_text="$2"
+  ensure_multi_user_enabled
+  screen_title "$action_text"
+  list_multi_users || return 0
+  ui_prompt "请输入用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+  user_name="${user_record%%|*}"
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  awk -F'|' -v n="$user_choice" -v enabled="$target_enabled" '
+    BEGIN { OFS = FS }
+    NF >= 9 {
+      i++
+      if (i == n) { $8 = enabled }
+    }
+    { print }
+  ' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  render_config
+  restart_service
+  ui_success "用户 $user_name 已更新为 $action_text。"
+}
+
+edit_multi_user_limits() {
+  ensure_multi_user_enabled
+  screen_title "修改用户到期/配额"
+  list_multi_users || return 0
+  ui_prompt "请输入用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note <<EOF
+$user_record
+EOF
+
+  ui_prompt "请输入新的到期日期 YYYY-MM-DD（当前 ${user_expire:-永不过期}，留空不变，输入 never 清空）："
+  read -r new_expire || true
+  new_expire="$(sanitize_user_field "$new_expire")"
+  case "$new_expire" in
+    '') new_expire="$user_expire" ;;
+    never|NEVER|none|NONE) new_expire="" ;;
+    *)
+      if ! is_valid_date "$new_expire"; then
+        ui_error "日期格式无效。"
+        return 1
+      fi
+      ;;
+  esac
+
+  ui_prompt "请输入新的流量配额（当前 $(format_bytes "${user_quota:-0}")，留空不变，0 为不限）："
+  read -r new_quota_input || true
+  new_quota_input="$(sanitize_user_field "$new_quota_input")"
+  if [ -z "$new_quota_input" ]; then
+    new_quota="$user_quota"
+  else
+    new_quota="$(quota_to_bytes "$new_quota_input")" || {
+      ui_error "流量配额格式无效。"
+      return 1
+    }
+  fi
+
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  awk -F'|' -v n="$user_choice" -v expire="$new_expire" -v quota="$new_quota" '
+    BEGIN { OFS = FS }
+    NF >= 9 {
+      i++
+      if (i == n) {
+        $5 = expire
+        $6 = quota
+      }
+    }
+    { print }
+  ' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  render_config
+  restart_service
+  ui_success "用户 $user_name 的到期/配额已更新。"
+}
+
+refresh_multi_user_status() {
+  ensure_multi_user_enabled
+  screen_title "刷新用户状态"
+  render_config
+  restart_service
+  ui_success "已重新渲染配置。过期或禁用用户不会写入 Mihomo users。"
+}
+
+multi_user_panel() {
+  need_root
+  ensure_installed
+  ensure_multi_user_enabled
+  while true; do
+    screen_title "多用户管理面板"
+    cat <<EOF
+ ${C_GREEN}1.${C_RESET} 添加用户
+ ${C_GREEN}2.${C_RESET} 查看用户
+ ${C_GREEN}3.${C_RESET} 删除用户
+ ${C_GREEN}4.${C_RESET} 禁用用户
+ ${C_GREEN}5.${C_RESET} 启用用户
+ ${C_GREEN}6.${C_RESET} 修改到期时间/流量配额
+ ${C_GREEN}7.${C_RESET} 刷新用户状态
+ ${C_GREEN}0.${C_RESET} => 返回主菜单
+${C_CYAN}====================================================${C_RESET}
+EOF
+    ui_prompt "请输入数字选择 (0-7)："
+    read -r user_panel_choice || true
+    case "$user_panel_choice" in
+      1) add_multi_user; pause ;;
+      2) list_multi_users; pause ;;
+      3) delete_multi_user; pause ;;
+      4) set_multi_user_enabled_state 0 "禁用用户"; pause ;;
+      5) set_multi_user_enabled_state 1 "启用用户"; pause ;;
+      6) edit_multi_user_limits; pause ;;
+      7) refresh_multi_user_status; pause ;;
+      0) return 0 ;;
+      *) ui_error "无效选择，请输入 0-7。"; pause ;;
+    esac
+  done
+}
+
 show_config() {
   need_root
   ensure_installed
@@ -1847,6 +2365,14 @@ menu() {
   while true; do
     clear 2>/dev/null || true
     current_status="$(service_status_text)"
+    multi_user_menu_line=""
+    menu_choices="0-9/22/33/44/55/66"
+    invalid_choices="0-9、22、33、44、55 或 66"
+    if multi_user_enabled; then
+      multi_user_menu_line="   ${C_GREEN}77.${C_RESET} 多用户管理面板"
+      menu_choices="0-9/22/33/44/55/66/77"
+      invalid_choices="0-9、22、33、44、55、66 或 77"
+    fi
     
     cat <<EOF
 ${C_CYAN}====================================================${C_RESET}
@@ -1877,11 +2403,12 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}44.${C_RESET} 性能优化菜单
    ${C_GREEN}55.${C_RESET} sysctl 网络优化
    ${C_GREEN}66.${C_RESET} IPv6 支持设置
+$multi_user_menu_line
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    printf "${C_BOLD}请输入数字选择 (0-9/22/33/44/55/66)：${C_RESET}"
+    printf "${C_BOLD}请输入数字选择 ($menu_choices)：${C_RESET}"
     read -r choice || exit 0
 
     case "$choice" in
@@ -1899,8 +2426,15 @@ EOF
       44) performance_tuning_menu; pause ;;
       55) optimize_sysctl_network; pause ;;
       66) ipv6_settings_menu; pause ;;
+      77)
+        if multi_user_enabled; then
+          multi_user_panel; pause
+        else
+          ui_error "多用户管理未启用。"; pause
+        fi
+        ;;
       0) clear; exit 0 ;;
-      *) ui_error "无效选择，请输入 0-9、22、33、44、55 或 66。"; pause ;;
+      *) ui_error "无效选择，请输入 $invalid_choices。"; pause ;;
     esac
   done
 }
@@ -1913,6 +2447,7 @@ case "${1:-}" in
   perf|performance|tune|44) performance_tuning_menu ;;
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
+  users|user|multi-user|77) multi_user_panel ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;
   delete|del|remove) delete_node ;;
