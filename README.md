@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.9.1
+# ✨ Mihomo Lite - 一键配置脚本 V1.9.2
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **🚀 性能优化**：支持运行时参数调优、sysctl 网络优化和公网 IP 本地缓存。
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
-* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动流量统计和用户专属订阅分发。
+* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
 
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 
 菜单输入 `66` 可配置 IPv6 支持：关闭 IPv6、开启 IPv6 监听但继续分享 IPv4、开启并优先分享 IPv6、手动指定分享 IP 或刷新公网 IP 缓存。
 
-如果初次安装 Mihomo 内核时选择启用多用户管理，菜单会显示 `77`。进入后可添加、查看、删除、启用/禁用用户，设置到期时间和流量配额，手动刷新用户流量统计，并分发用户专属订阅；未启用时不会显示该入口，也不会创建多用户数据库。
+如果初次安装 Mihomo 内核时选择启用多用户管理，菜单会显示 `77`。进入后可添加、查看、删除、启用/禁用用户，设置到期时间和流量配额，手动刷新用户流量统计，开启每 10 分钟自动刷新，并分发用户专属订阅；未启用时不会显示该入口，也不会创建多用户数据库。
 
 ---
 
@@ -75,6 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 | **节点数据库** | `/etc/mihomo/nodes.db` | 本地化存储已生成的节点记录 |
 | **用户数据库** | `/etc/mihomo/users.db` | 仅启用多用户管理时创建 |
 | **流量快照** | `/etc/mihomo/traffic.db` | 记录活跃连接的上次统计快照 |
+| **自动刷新任务** | root crontab | 仅启用自动流量刷新时写入 |
 | **功能开关** | `/etc/mihomo/features.env` | 记录是否启用多用户管理 |
 | **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT` 与 `GOGC` |
 | **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
@@ -131,3 +132,4 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
 * 菜单 `77` -> `9` 可重置指定用户的已用流量，便于测试配额。
 * 菜单 `77` -> `10` 可输出指定用户的单节点链接和 Base64 订阅，也可执行 `mh sub-user`。
 * 菜单 `77` -> `11` 可修改指定用户的独立监听端口。
+* 菜单 `77` -> `12` 可启用或关闭每 10 分钟自动刷新流量统计，也可执行 `mh traffic-cron`；自动任务通过 root crontab 调用 `mh traffic-auto`，并使用轻量锁避免刷新重叠。

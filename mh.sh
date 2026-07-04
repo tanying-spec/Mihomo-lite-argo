@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.1"
+SCRIPT_VERSION="1.9.2"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -14,6 +14,8 @@ TRAFFIC_DB="$CONFIG_DIR/traffic.db"
 TRAFFIC_CHAIN="MIHOMO_LITE_USERS"
 TRAFFIC_CHAIN_IN="${TRAFFIC_CHAIN}_IN"
 TRAFFIC_CHAIN_OUT="${TRAFFIC_CHAIN}_OUT"
+TRAFFIC_CRON_MARK="mihomo-lite-traffic-auto"
+TRAFFIC_LOCK_DIR="$CONFIG_DIR/traffic.lock"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
@@ -159,6 +161,41 @@ install_packages() {
 
 ensure_curl() {
   command -v curl >/dev/null 2>&1 || install_packages curl
+}
+
+ensure_cron_service() {
+  manager="$(service_manager)"
+  if command -v crontab >/dev/null 2>&1; then
+    :
+  elif command -v apk >/dev/null 2>&1; then
+    install_packages dcron
+  elif command -v apt-get >/dev/null 2>&1; then
+    install_packages cron
+  else
+    ui_error "未找到 crontab，且无法自动安装 cron。"
+    return 1
+  fi
+
+  case "$manager" in
+    systemd)
+      if systemctl list-unit-files cron.service >/dev/null 2>&1; then
+        systemctl enable --now cron >/dev/null 2>&1 || true
+      elif systemctl list-unit-files crond.service >/dev/null 2>&1; then
+        systemctl enable --now crond >/dev/null 2>&1 || true
+      fi
+      ;;
+    openrc)
+      if command -v rc-service >/dev/null 2>&1; then
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond start >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
+
+  command -v crontab >/dev/null 2>&1 || {
+    ui_error "crontab 仍不可用，无法启用自动刷新。"
+    return 1
+  }
 }
 
 make_temp() {
@@ -2192,16 +2229,17 @@ refresh_multi_user_status() {
 }
 
 update_user_traffic_from_iptables() {
+  traffic_quiet="${1:-0}"
   ensure_multi_user_enabled
-  screen_title "刷新流量统计"
+  [ "$traffic_quiet" = "1" ] || screen_title "刷新流量统计"
   if [ ! -s "$USERS_DB" ]; then
-    ui_warn "当前没有多用户记录。"
+    [ "$traffic_quiet" = "1" ] || ui_warn "当前没有多用户记录。"
     return 0
   fi
 
   ensure_user_ports
   ensure_user_traffic_rules_ready || {
-    ui_error "无法准备 iptables 统计规则。请检查容器 NET_ADMIN 权限。"
+    [ "$traffic_quiet" = "1" ] || ui_error "无法准备 iptables 统计规则。请检查容器 NET_ADMIN 权限。"
     return 1
   }
   had_traffic_snapshot=1
@@ -2214,7 +2252,7 @@ update_user_traffic_from_iptables() {
 
   ipt="$(iptables_cmd)" || {
     rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
-    ui_error "未找到 iptables，无法读取流量统计。"
+    [ "$traffic_quiet" = "1" ] || ui_error "未找到 iptables，无法读取流量统计。"
     return 1
   }
   {
@@ -2249,7 +2287,7 @@ update_user_traffic_from_iptables() {
 
   if [ ! -s "$tmp_current" ]; then
     rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
-    ui_warn "当前没有可读取的用户端口计数。请确认用户端口已有连接，并检查 iptables 权限。"
+    [ "$traffic_quiet" = "1" ] || ui_warn "当前没有可读取的用户端口计数。请确认用户端口已有连接，并检查 iptables 权限。"
     return 1
   fi
 
@@ -2257,7 +2295,7 @@ update_user_traffic_from_iptables() {
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
     rm -f "$tmp_deltas" "$tmp_users"
-    ui_warn "已建立端口流量快照。请在用户产生流量后再次刷新，才会累计增量。"
+    [ "$traffic_quiet" = "1" ] || ui_warn "已建立端口流量快照。请在用户产生流量后再次刷新，才会累计增量。"
     return 0
   fi
 
@@ -2282,7 +2320,7 @@ update_user_traffic_from_iptables() {
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
     rm -f "$tmp_deltas" "$tmp_users"
-    ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
+    [ "$traffic_quiet" = "1" ] || ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
     return 0
   fi
 
@@ -2322,7 +2360,7 @@ EOF
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
     rm -f "$tmp_deltas" "$tmp_users"
-    ui_warn "iptables 返回了端口流量，但未匹配到 users.db 中的用户端口。请确认连接走的是用户独立端口。"
+    [ "$traffic_quiet" = "1" ] || ui_warn "iptables 返回了端口流量，但未匹配到 users.db 中的用户端口。请确认连接走的是用户独立端口。"
     return 1
   fi
 
@@ -2332,20 +2370,119 @@ EOF
   chmod 600 "$TRAFFIC_DB"
   rm -f "$tmp_deltas"
 
-  ui_success "已更新 $changed_count 个用户的流量用量。"
-  list_multi_users
+  [ "$traffic_quiet" = "1" ] || ui_success "已更新 $changed_count 个用户的流量用量。"
+  [ "$traffic_quiet" = "1" ] || list_multi_users
   if [ "$quota_crossed_count" != "0" ]; then
     render_config
     restart_service
     refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
-    ui_success "检测到 $quota_crossed_count 个用户达到流量配额，已重载服务并移除对应 listener。"
+    [ "$traffic_quiet" = "1" ] || ui_success "检测到 $quota_crossed_count 个用户达到流量配额，已重载服务并移除对应 listener。"
   else
-    ui_success "未触发新的配额限制，本次未重启 Mihomo。"
+    [ "$traffic_quiet" = "1" ] || ui_success "未触发新的配额限制，本次未重启 Mihomo。"
   fi
 }
 
 update_user_traffic_from_connections() {
-  update_user_traffic_from_iptables
+  update_user_traffic_from_iptables "${1:-0}"
+}
+
+traffic_auto_cron_line() {
+  printf '*/10 * * * * %s traffic-auto >/dev/null 2>&1 # %s\n' "$CLI_PATH" "$TRAFFIC_CRON_MARK"
+}
+
+traffic_auto_enabled() {
+  command -v crontab >/dev/null 2>&1 || return 1
+  crontab -l 2>/dev/null | grep -q "$TRAFFIC_CRON_MARK"
+}
+
+run_traffic_auto_refresh() {
+  need_root
+  ensure_installed
+  ensure_multi_user_enabled
+  if ! mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null; then
+    if [ -f "$TRAFFIC_LOCK_DIR/pid" ]; then
+      lock_pid="$(cat "$TRAFFIC_LOCK_DIR/pid" 2>/dev/null || printf '')"
+      case "$lock_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          kill -0 "$lock_pid" 2>/dev/null && exit 0
+          ;;
+      esac
+    fi
+    rm -f "$TRAFFIC_LOCK_DIR/pid"
+    rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || exit 0
+    mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || exit 0
+  fi
+  printf '%s\n' "$$" > "$TRAFFIC_LOCK_DIR/pid"
+  trap 'rm -f "$TRAFFIC_LOCK_DIR/pid"; rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+  update_user_traffic_from_connections 1
+}
+
+enable_traffic_auto_refresh() {
+  ensure_multi_user_enabled
+  ensure_cron_service || return 1
+  tmp_file="$(make_temp "$CONFIG_DIR/cron.XXXXXX")"
+  crontab -l 2>/dev/null | grep -v "$TRAFFIC_CRON_MARK" > "$tmp_file" || true
+  traffic_auto_cron_line >> "$tmp_file"
+  crontab "$tmp_file" || {
+    rm -f "$tmp_file"
+    ui_error "写入 crontab 失败。"
+    return 1
+  }
+  rm -f "$tmp_file"
+  ui_success "已启用每 10 分钟自动刷新流量统计。"
+}
+
+disable_traffic_auto_refresh() {
+  if ! command -v crontab >/dev/null 2>&1; then
+    ui_success "未检测到 crontab，无需关闭自动刷新。"
+    return 0
+  fi
+  tmp_file="$(make_temp "$CONFIG_DIR/cron.XXXXXX")"
+  crontab -l 2>/dev/null | grep -v "$TRAFFIC_CRON_MARK" > "$tmp_file" || true
+  crontab "$tmp_file" || {
+    rm -f "$tmp_file"
+    ui_error "更新 crontab 失败。"
+    return 1
+  }
+  rm -f "$tmp_file"
+  ui_success "已关闭自动刷新流量统计。"
+}
+
+cleanup_traffic_auto_refresh() {
+  command -v crontab >/dev/null 2>&1 || return 0
+  tmp_file="$(make_temp /tmp/mh-cron.XXXXXX)"
+  crontab -l 2>/dev/null | grep -v "$TRAFFIC_CRON_MARK" > "$tmp_file" || true
+  crontab "$tmp_file" >/dev/null 2>&1 || true
+  rm -f "$tmp_file"
+  rm -f "$TRAFFIC_LOCK_DIR/pid"
+  rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || true
+}
+
+traffic_auto_refresh_menu() {
+  ensure_multi_user_enabled
+  screen_title "自动刷新流量统计"
+  if command -v crontab >/dev/null 2>&1 && traffic_auto_enabled; then
+    auto_status="已启用"
+  else
+    auto_status="未启用"
+  fi
+  cat <<EOF
+ 当前状态：$auto_status
+
+ ${C_GREEN}1.${C_RESET} 启用每 10 分钟自动刷新
+ ${C_GREEN}2.${C_RESET} 关闭自动刷新
+ ${C_GREEN}0.${C_RESET} => 返回上一级
+${C_CYAN}====================================================${C_RESET}
+EOF
+  ui_prompt "请输入数字选择 (0-2)："
+  read -r auto_choice || true
+  case "$auto_choice" in
+    1) enable_traffic_auto_refresh ;;
+    2) disable_traffic_auto_refresh ;;
+    0) return 0 ;;
+    *) ui_error "无效选择。" ;;
+  esac
 }
 
 reset_multi_user_traffic() {
@@ -2556,10 +2693,11 @@ multi_user_panel() {
  ${C_GREEN}9.${C_RESET} 重置用户流量
  ${C_GREEN}10.${C_RESET} 分发用户订阅
  ${C_GREEN}11.${C_RESET} 修改用户端口
+ ${C_GREEN}12.${C_RESET} 自动刷新流量统计
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    ui_prompt "请输入数字选择 (0-11)："
+    ui_prompt "请输入数字选择 (0-12)："
     read -r user_panel_choice || true
     case "$user_panel_choice" in
       1) add_multi_user; pause ;;
@@ -2573,8 +2711,9 @@ EOF
       9) reset_multi_user_traffic; pause ;;
       10) show_user_subscription; pause ;;
       11) edit_multi_user_port; pause ;;
+      12) traffic_auto_refresh_menu; pause ;;
       0) return 0 ;;
-      *) ui_error "无效选择，请输入 0-11。"; pause ;;
+      *) ui_error "无效选择，请输入 0-12。"; pause ;;
     esac
   done
 }
@@ -2939,6 +3078,7 @@ uninstall_all() {
   esac
 
   cleanup_user_traffic_rules
+  cleanup_traffic_auto_refresh
   rm -f "$BIN_PATH" "$CLI_PATH"
   rm -rf "$CONFIG_DIR" "$LOG_DIR"
   ui_success "卸载完成。"
@@ -3031,6 +3171,8 @@ case "${1:-}" in
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;
+  traffic-auto) run_traffic_auto_refresh ;;
+  traffic-cron|auto-traffic|traffic-auto-menu) need_root; ensure_installed; traffic_auto_refresh_menu ;;
   sub-user|user-sub|user-subscription) need_root; ensure_installed; show_user_subscription ;;
   users|user|multi-user|77) multi_user_panel ;;
   list|nodes) show_all_nodes ;;
