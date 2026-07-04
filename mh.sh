@@ -3,13 +3,14 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
+TRAFFIC_DB="$CONFIG_DIR/traffic.db"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
@@ -155,6 +156,10 @@ install_packages() {
 
 ensure_curl() {
   command -v curl >/dev/null 2>&1 || install_packages curl
+}
+
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 || install_packages jq
 }
 
 make_temp() {
@@ -1964,6 +1969,193 @@ refresh_multi_user_status() {
   ui_success "已重新渲染配置。过期或禁用用户不会写入 Mihomo users。"
 }
 
+fetch_mihomo_connections() {
+  secret_file="$CONFIG_DIR/controller.secret"
+  if [ ! -s "$secret_file" ]; then
+    ui_error "找不到 Mihomo API 密钥文件：$secret_file"
+    return 1
+  fi
+
+  ensure_curl
+  controller_secret="$(cat "$secret_file")"
+  curl -m 5 -fsS \
+    -H "Authorization: Bearer $controller_secret" \
+    "http://127.0.0.1:9090/connections"
+}
+
+update_user_traffic_from_connections() {
+  ensure_multi_user_enabled
+  screen_title "刷新流量统计"
+  if [ ! -s "$USERS_DB" ]; then
+    ui_warn "当前没有多用户记录。"
+    return 0
+  fi
+
+  ensure_jq
+  had_traffic_snapshot=1
+  [ -s "$TRAFFIC_DB" ] || had_traffic_snapshot=0
+  [ -f "$TRAFFIC_DB" ] || : > "$TRAFFIC_DB"
+  chmod 600 "$TRAFFIC_DB"
+  tmp_json="$(make_temp "$CONFIG_DIR/connections.XXXXXX")"
+  tmp_current="$(make_temp "$CONFIG_DIR/traffic-current.XXXXXX")"
+  tmp_deltas="$(make_temp "$CONFIG_DIR/traffic-delta.XXXXXX")"
+  tmp_users="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+
+  if ! fetch_mihomo_connections > "$tmp_json"; then
+    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
+    ui_error "无法读取 Mihomo /connections，请确认服务正在运行且 external-controller 可用。"
+    return 1
+  fi
+
+  if ! jq -r '
+    def user_field:
+      (.metadata.inboundUser // .metadata.user // .metadata.username //
+       .metadata.authUser // .metadata.account // .metadata.email //
+       .inboundUser // .user // .username // .authUser // .account // .email // "");
+    def clean_field: tostring | gsub("\\|"; "");
+    (.connections // [])[] |
+    ((.upload // .uplink // .up // 0) | tonumber? // 0) as $upload |
+    ((.download // .downlink // .down // 0) | tonumber? // 0) as $download |
+    [(.id // .ID // .uuid // .metadata.uid // ""), user_field, $upload, $download, ($upload + $download)] |
+    select(.[0] != "" and .[1] != "") |
+    map(clean_field) |
+    join("|")
+  ' "$tmp_json" > "$tmp_current"; then
+    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
+    ui_error "Mihomo /connections 返回内容不是可解析的 JSON。"
+    return 1
+  fi
+
+  if [ ! -s "$tmp_current" ]; then
+    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
+    ui_warn "当前 Mihomo API 未返回可识别的用户字段，无法在同一端口下精确区分每个用户流量。"
+    ui_warn "可手动查看：curl -H \"Authorization: Bearer \$(cat $CONFIG_DIR/controller.secret)\" http://127.0.0.1:9090/connections"
+    return 1
+  fi
+
+  if [ "$had_traffic_snapshot" = "0" ]; then
+    mv "$tmp_current" "$TRAFFIC_DB"
+    chmod 600 "$TRAFFIC_DB"
+    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
+    ui_warn "已建立当前连接快照。请在用户产生流量后再次刷新，才会累计增量。"
+    return 0
+  fi
+
+  awk -F'|' '
+    BEGIN { OFS = FS }
+    NR == FNR {
+      previous[$1] = $5
+      next
+    }
+    {
+      current = $5 + 0
+      old = (($1 in previous) ? previous[$1] : 0) + 0
+      delta = current - old
+      if (delta > 0) add[$2] += delta
+    }
+    END {
+      for (user in add) print user, int(add[user])
+    }
+  ' "$TRAFFIC_DB" "$tmp_current" > "$tmp_deltas" 2>/dev/null
+
+  if [ ! -s "$tmp_deltas" ]; then
+    mv "$tmp_current" "$TRAFFIC_DB"
+    chmod 600 "$TRAFFIC_DB"
+    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
+    ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
+    return 0
+  fi
+
+  changed_count="$(awk -F'|' '
+    NR == FNR {
+      delta[$1] = $2 + 0
+      next
+    }
+    BEGIN { OFS = FS }
+    NF >= 9 {
+      user_delta = 0
+      if ($1 in delta) user_delta += delta[$1]
+      if ($4 in delta && $4 != $1) user_delta += delta[$4]
+      if (user_delta > 0) {
+        old = $7 + 0
+        $7 = int(old + user_delta)
+        changed++
+      }
+    }
+    { print }
+    END {
+      printf "%d", changed > "/dev/stderr"
+    }
+  ' "$tmp_deltas" "$USERS_DB" > "$tmp_users" 2>"$tmp_users.count")"
+  changed_count="$(cat "$tmp_users.count" 2>/dev/null || printf '0')"
+  rm -f "$tmp_users.count"
+
+  if [ "${changed_count:-0}" = "0" ]; then
+    mv "$tmp_current" "$TRAFFIC_DB"
+    chmod 600 "$TRAFFIC_DB"
+    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
+    ui_warn "API 返回了用户流量，但未匹配到 users.db 中的用户。请确认用户名与连接用户字段一致。"
+    return 1
+  fi
+
+  mv "$tmp_users" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  mv "$tmp_current" "$TRAFFIC_DB"
+  chmod 600 "$TRAFFIC_DB"
+  rm -f "$tmp_json" "$tmp_deltas"
+
+  ui_success "已更新 $changed_count 个用户的流量用量。"
+  list_multi_users
+  render_config
+  restart_service
+  ui_success "已根据最新到期时间和流量配额重载服务。"
+}
+
+reset_multi_user_traffic() {
+  ensure_multi_user_enabled
+  screen_title "重置用户流量"
+  list_multi_users || return 0
+  ui_prompt "请输入要重置流量的用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+  user_name="${user_record%%|*}"
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  tmp_traffic="$(make_temp "$CONFIG_DIR/traffic.XXXXXX")"
+  awk -F'|' -v n="$user_choice" '
+    BEGIN { OFS = FS }
+    NF >= 9 {
+      i++
+      if (i == n) { $7 = 0 }
+    }
+    { print }
+  ' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  if [ -s "$TRAFFIC_DB" ]; then
+    awk -F'|' -v u="$user_name" '$2 != u { print }' "$TRAFFIC_DB" > "$tmp_traffic"
+    mv "$tmp_traffic" "$TRAFFIC_DB"
+  else
+    rm -f "$tmp_traffic"
+    : > "$TRAFFIC_DB"
+  fi
+  chmod 600 "$TRAFFIC_DB"
+  render_config
+  restart_service
+  ui_success "用户 $user_name 的已用流量已重置。"
+}
+
 multi_user_panel() {
   need_root
   ensure_installed
@@ -1978,10 +2170,12 @@ multi_user_panel() {
  ${C_GREEN}5.${C_RESET} 启用用户
  ${C_GREEN}6.${C_RESET} 修改到期时间/流量配额
  ${C_GREEN}7.${C_RESET} 刷新用户状态
+ ${C_GREEN}8.${C_RESET} 刷新流量统计
+ ${C_GREEN}9.${C_RESET} 重置用户流量
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    ui_prompt "请输入数字选择 (0-7)："
+    ui_prompt "请输入数字选择 (0-9)："
     read -r user_panel_choice || true
     case "$user_panel_choice" in
       1) add_multi_user; pause ;;
@@ -1991,8 +2185,10 @@ EOF
       5) set_multi_user_enabled_state 1 "启用用户"; pause ;;
       6) edit_multi_user_limits; pause ;;
       7) refresh_multi_user_status; pause ;;
+      8) update_user_traffic_from_connections; pause ;;
+      9) reset_multi_user_traffic; pause ;;
       0) return 0 ;;
-      *) ui_error "无效选择，请输入 0-7。"; pause ;;
+      *) ui_error "无效选择，请输入 0-9。"; pause ;;
     esac
   done
 }
@@ -2447,6 +2643,7 @@ case "${1:-}" in
   perf|performance|tune|44) performance_tuning_menu ;;
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
+  traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;
   users|user|multi-user|77) multi_user_panel ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;

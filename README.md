@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.8.0
+# ✨ Mihomo Lite - 一键配置脚本 V1.8.1
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **🚀 性能优化**：支持运行时参数调优、sysctl 网络优化和公网 IP 本地缓存。
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
-* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户增删、启停、到期时间和流量配额字段。
+* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户增删、启停、到期时间、独立流量配额和手动流量统计。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
 
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 
 菜单输入 `66` 可配置 IPv6 支持：关闭 IPv6、开启 IPv6 监听但继续分享 IPv4、开启并优先分享 IPv6、手动指定分享 IP 或刷新公网 IP 缓存。
 
-如果初次安装 Mihomo 内核时选择启用多用户管理，菜单会显示 `77`。进入后可添加、查看、删除、启用/禁用用户，并设置到期时间和流量配额字段；未启用时不会显示该入口，也不会创建多用户数据库。
+如果初次安装 Mihomo 内核时选择启用多用户管理，菜单会显示 `77`。进入后可添加、查看、删除、启用/禁用用户，设置到期时间和流量配额，并手动刷新用户流量统计；未启用时不会显示该入口，也不会创建多用户数据库。
 
 ---
 
@@ -74,6 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 | **主配置文件** | `/etc/mihomo/config.yaml` | Mihomo 运行的源配置 |
 | **节点数据库** | `/etc/mihomo/nodes.db` | 本地化存储已生成的节点记录 |
 | **用户数据库** | `/etc/mihomo/users.db` | 仅启用多用户管理时创建 |
+| **流量快照** | `/etc/mihomo/traffic.db` | 记录活跃连接的上次统计快照 |
 | **功能开关** | `/etc/mihomo/features.env` | 记录是否启用多用户管理 |
 | **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT` 与 `GOGC` |
 | **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
@@ -117,9 +118,13 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
 
 多用户管理只能在首次执行 `mh install` 安装 Mihomo 内核时选择是否启用。未启用时，主菜单不会显示 `77`，也不会创建 `/etc/mihomo/users.db`。
 
-启用后，用户会绑定到已有节点。脚本会把未过期且未禁用的用户写入对应 listener 的 `users` 配置中：
+启用后，用户会绑定到已有节点。脚本会把未过期、未禁用且未超出流量配额的用户写入对应 listener 的 `users` 配置中：
 
 * VLESS + Reality / VLESS + WebSocket：为用户生成独立 UUID。
 * Hysteria2 / AnyTLS：为用户生成独立密码。
-* 到期用户和禁用用户会在重新渲染配置时自动从 Mihomo 配置中排除。
-* 流量配额字段会被保存到用户数据库中；当前版本不内置精确流量统计任务，但当 `used_bytes` 被后续统计逻辑更新到超过配额时，用户会被排除出 Mihomo 配置。
+* 到期、禁用和超出流量配额的用户会在重新渲染配置时自动从 Mihomo 配置中排除。
+* 菜单 `77` -> `8` 可通过 Mihomo `external-controller` 的 `/connections` 接口刷新用户流量统计，也可执行 `mh traffic`。
+* 第一次刷新会建立 `/etc/mihomo/traffic.db` 快照；后续刷新会按同一连接的上传 + 下载增量累加到用户 `used_bytes`。
+* 统计逻辑会优先按用户名匹配，也会尝试按用户 UUID / 密码匹配；若当前 Mihomo API 没有返回可识别字段，脚本不会按端口聚合流量，因为同一端口下无法精确区分每个用户。
+* 手动刷新只能统计两次刷新之间仍存在于 `/connections` 的活跃连接增量；如果需要更接近实时的配额控制，可以用 cron 定时执行 `mh traffic`。
+* 菜单 `77` -> `9` 可重置指定用户的已用流量，便于测试配额。
