@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.8.2"
+SCRIPT_VERSION="1.9.0"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -11,6 +11,9 @@ CONFIG_FILE="$CONFIG_DIR/config.yaml"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
 TRAFFIC_DB="$CONFIG_DIR/traffic.db"
+TRAFFIC_CHAIN="MIHOMO_LITE_USERS"
+TRAFFIC_CHAIN_IN="${TRAFFIC_CHAIN}_IN"
+TRAFFIC_CHAIN_OUT="${TRAFFIC_CHAIN}_OUT"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
@@ -156,10 +159,6 @@ install_packages() {
 
 ensure_curl() {
   command -v curl >/dev/null 2>&1 || install_packages curl
-}
-
-ensure_jq() {
-  command -v jq >/dev/null 2>&1 || install_packages jq
 }
 
 make_temp() {
@@ -470,6 +469,32 @@ node_record_by_name_proto() {
   awk -F'|' -v name="$lookup_name" -v proto="$lookup_proto" '
     $1 == proto && $2 == name { print; exit }
   ' "$NODES_DB"
+}
+
+ensure_user_ports() {
+  [ "$MIHOMO_MULTI_USER" = "true" ] || return 0
+  [ -s "$USERS_DB" ] || return 0
+
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  changed=0
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
+    [ -n "$user_name" ] || continue
+    case "${user_port:-}" in
+      ''|*[!0-9]*)
+        user_port="$(unique_port)"
+        changed=1
+        ;;
+    esac
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$user_name" "$user_node" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "${user_used:-0}" "${user_enabled:-1}" "$user_created" "$user_note" "$user_port"
+  done < "$USERS_DB" > "$tmp_file"
+
+  if [ "$changed" = "1" ]; then
+    mv "$tmp_file" "$USERS_DB"
+    chmod 600 "$USERS_DB"
+  else
+    rm -f "$tmp_file"
+  fi
 }
 
 detect_arch() {
@@ -792,31 +817,108 @@ public_ip() {
   printf 'YOUR_SERVER_IP'
 }
 
-render_extra_users() {
-  render_node_name="$1"
-  render_proto="$2"
-  render_style="$3"
+render_user_listener() {
+  render_user_name="$1"
+  render_user_node="$2"
+  render_user_proto="$3"
+  render_user_credential="$4"
+  render_user_port="$5"
+  render_listen_address="$6"
 
+  render_node_record="$(node_record_by_name_proto "$render_user_node" "$render_user_proto")"
+  [ -n "$render_node_record" ] || return 0
+
+  IFS='|' read -r render_proto render_node_name render_node_port render_value1 render_value2 render_value3 render_value4 render_value5 render_value6 <<EOF
+$render_node_record
+EOF
+
+  case "$render_user_proto" in
+    vless-reality)
+      render_sni="$render_value2"
+      render_dest="$render_value3"
+      render_private_key="$render_value4"
+      render_short_id="$render_value6"
+      cat <<EOF
+  - name: "$render_user_name"
+    type: vless
+    port: $render_user_port
+    listen: "$render_listen_address"
+    users:
+      - username: "$render_user_name"
+        uuid: "$render_user_credential"
+    tls: true
+    reality-config:
+      dest: "$render_dest"
+      private-key: "$render_private_key"
+      short-id:
+        - "$render_short_id"
+      server-names:
+        - "$render_sni"
+EOF
+      ;;
+    hysteria2)
+      render_sni="$render_value2"
+      render_cert_file="$render_value3"
+      render_key_file="$render_value4"
+      render_salamander_password="$render_value5"
+      cat <<EOF
+  - name: "$render_user_name"
+    type: hysteria2
+    port: $render_user_port
+    listen: "$render_listen_address"
+    users:
+      "$render_user_name": "$render_user_credential"
+    certificate: "$render_cert_file"
+    private-key: "$render_key_file"
+    up: ${HY2_UP_MBPS} Mbps
+    down: ${HY2_DOWN_MBPS} Mbps
+EOF
+      if [ -n "$render_salamander_password" ]; then
+        cat <<EOF
+    obfs: salamander
+    obfs-password: "$render_salamander_password"
+EOF
+      fi
+      ;;
+    anytls)
+      render_cert_file="$render_value3"
+      render_key_file="$render_value4"
+      cat <<EOF
+  - name: "$render_user_name"
+    type: anytls
+    port: $render_user_port
+    listen: "$render_listen_address"
+    users:
+      "$render_user_name": "$render_user_credential"
+    certificate: "$render_cert_file"
+    private-key: "$render_key_file"
+EOF
+      ;;
+    vless-ws)
+      render_ws_path="$render_value2"
+      cat <<EOF
+  - name: "$render_user_name"
+    type: vless
+    port: $render_user_port
+    listen: "$render_listen_address"
+    allow-insecure: true
+    users:
+      - username: "$render_user_name"
+        uuid: "$render_user_credential"
+    ws-path: "$render_ws_path"
+EOF
+      ;;
+  esac
+}
+
+render_user_listeners() {
   [ "$MIHOMO_MULTI_USER" = "true" ] || return 0
   [ -s "$USERS_DB" ] || return 0
-
-  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note; do
-    [ "$user_node" = "$render_node_name" ] || continue
-    [ "$user_proto" = "$render_proto" ] || continue
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
+    [ -n "$user_name" ] || continue
+    [ -n "${user_port:-}" ] || continue
     is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
-    case "$render_style" in
-      map)
-        cat <<EOF
-      "$user_name": "$user_credential"
-EOF
-        ;;
-      list)
-        cat <<EOF
-      - username: "$user_name"
-        uuid: "$user_credential"
-EOF
-        ;;
-    esac
+    render_user_listener "$user_name" "$user_node" "$user_proto" "$user_credential" "$user_port" "$cfg_listen_address"
   done < "$USERS_DB"
 }
 
@@ -824,6 +926,7 @@ render_config() {
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
   load_network_settings
   load_feature_settings
+  ensure_user_ports
   cfg_ipv6="$MIHOMO_IPV6"
   cfg_listen_address="$(listener_address)"
   tmp_file="$(make_temp "$CONFIG_DIR/config.XXXXXX")"
@@ -884,7 +987,6 @@ EOF
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
 EOF
-          render_extra_users "$cfg_node_name" "$cfg_proto" list >> "$tmp_file"
           cat >> "$tmp_file" <<EOF
     tls: true
     reality-config:
@@ -909,7 +1011,6 @@ EOF
     users:
       "$cfg_node_name": "$cfg_node_password"
 EOF
-          render_extra_users "$cfg_node_name" "$cfg_proto" map >> "$tmp_file"
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
@@ -935,7 +1036,6 @@ EOF
     users:
       "$cfg_node_name": "$cfg_node_password"
 EOF
-          render_extra_users "$cfg_node_name" "$cfg_proto" map >> "$tmp_file"
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
@@ -954,13 +1054,13 @@ EOF
       - username: "$cfg_node_name"
         uuid: "$cfg_node_uuid"
 EOF
-          render_extra_users "$cfg_node_name" "$cfg_proto" list >> "$tmp_file"
           cat >> "$tmp_file" <<EOF
     ws-path: "$cfg_ws_path"
 EOF
           ;;
       esac
     done < "$NODES_DB"
+    render_user_listeners >> "$tmp_file"
   else
     printf 'listeners: []\n' >> "$tmp_file"
   fi
@@ -1115,12 +1215,119 @@ node_name_exists() {
 
 port_in_use() {
   port="$1"
-  awk -F'|' -v p="$port" '
+  if awk -F'|' -v p="$port" '
     $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
       if ($3 == p) found = 1
     }
     END { exit found ? 0 : 1 }
-  ' "$NODES_DB" 2>/dev/null
+  ' "$NODES_DB" 2>/dev/null; then
+    return 0
+  fi
+
+  [ -s "$USERS_DB" ] || return 1
+  awk -F'|' -v p="$port" '
+    NF >= 11 && $11 == p { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$USERS_DB" 2>/dev/null
+}
+
+ensure_iptables() {
+  command -v iptables >/dev/null 2>&1 || install_packages iptables
+}
+
+iptables_cmd() {
+  if command -v iptables >/dev/null 2>&1; then
+    printf 'iptables'
+    return 0
+  fi
+  return 1
+}
+
+reset_user_traffic_snapshot() {
+  tmp_file="$(make_temp "$CONFIG_DIR/traffic.XXXXXX")"
+  if [ -s "$USERS_DB" ]; then
+    while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
+      [ -n "$user_name" ] || continue
+      case "${user_port:-}" in ''|*[!0-9]*) continue ;; esac
+      is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
+      printf '%s|0\n' "$user_port"
+    done < "$USERS_DB" > "$tmp_file"
+  else
+    : > "$tmp_file"
+  fi
+  mv "$tmp_file" "$TRAFFIC_DB"
+  chmod 600 "$TRAFFIC_DB"
+}
+
+refresh_user_traffic_rules() {
+  ensure_multi_user_enabled
+  ensure_user_ports
+  ensure_iptables
+  ipt="$(iptables_cmd)" || {
+    ui_error "未找到 iptables，无法启用端口级流量统计。"
+    return 1
+  }
+
+  "$ipt" -N "$TRAFFIC_CHAIN_IN" 2>/dev/null || true
+  "$ipt" -N "$TRAFFIC_CHAIN_OUT" 2>/dev/null || true
+  "$ipt" -F "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
+    ui_error "无法写入 iptables。LXC 容器可能缺少 NET_ADMIN 权限。"
+    return 1
+  }
+  "$ipt" -F "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
+    ui_error "无法写入 iptables。LXC 容器可能缺少 NET_ADMIN 权限。"
+    return 1
+  }
+  "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$ipt" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
+    ui_error "无法挂载 iptables 入站统计链。请检查容器权限。"
+    return 1
+  }
+  "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$ipt" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
+    ui_error "无法挂载 iptables 出站统计链。请检查容器权限。"
+    return 1
+  }
+
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
+    [ -n "$user_name" ] || continue
+    case "${user_port:-}" in ''|*[!0-9]*) continue ;; esac
+    is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
+    "$ipt" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
+    "$ipt" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
+    "$ipt" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
+    "$ipt" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
+  done < "$USERS_DB"
+  reset_user_traffic_snapshot
+}
+
+refresh_user_traffic_rules_if_available() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  refresh_user_traffic_rules
+}
+
+ensure_user_traffic_rules_ready() {
+  ensure_iptables
+  ipt="$(iptables_cmd)" || return 1
+  if ! "$ipt" -L "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || ! "$ipt" -L "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; then
+    refresh_user_traffic_rules
+    return $?
+  fi
+  "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$ipt" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || return 1
+  "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$ipt" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || return 1
+}
+
+cleanup_user_traffic_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  ipt="$(iptables_cmd)" || return 0
+  while "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1; do
+    "$ipt" -D INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || break
+  done
+  while "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; do
+    "$ipt" -D OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || break
+  done
+  "$ipt" -F "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
+  "$ipt" -F "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
+  "$ipt" -X "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
+  "$ipt" -X "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
 }
 
 prompt_node_name() {
@@ -1722,9 +1929,10 @@ list_multi_users() {
     return 1
   fi
 
+  ensure_user_ports
   ui_section "多用户列表"
   i=1
-  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note; do
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
     [ -n "$user_name" ] || continue
     if is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used"; then
       status="启用"
@@ -1736,8 +1944,8 @@ list_multi_users() {
     quota_text="不限"
     [ "${user_quota:-0}" != "0" ] && quota_text="$(format_bytes "$user_quota")"
     used_text="$(format_bytes "${user_used:-0}")"
-    printf ' %s%s.%s %s%s%s  node=%s  proto=%s  expire=%s  quota=%s  used=%s  status=%s\n' \
-      "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$user_name" "$C_RESET" "$user_node" "$user_proto" "${user_expire:-never}" "$quota_text" "$used_text" "$status"
+    printf ' %s%s.%s %s%s%s  node=%s  proto=%s  port=%s  expire=%s  quota=%s  used=%s  status=%s\n' \
+      "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$user_name" "$C_RESET" "$user_node" "$user_proto" "${user_port:-unknown}" "${user_expire:-never}" "$quota_text" "$used_text" "$status"
     i=$((i + 1))
   done < "$USERS_DB"
 }
@@ -1816,15 +2024,17 @@ EOF
   esac
 
   user_created="$(today_ymd)"
-  printf '%s|%s|%s|%s|%s|%s|0|1|%s|\n' \
-    "$user_name" "$user_node_name" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "$user_created" >> "$USERS_DB"
+  user_port="$(unique_port)"
+  printf '%s|%s|%s|%s|%s|%s|0|1|%s||%s\n' \
+    "$user_name" "$user_node_name" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "$user_created" "$user_port" >> "$USERS_DB"
   chmod 600 "$USERS_DB"
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已添加并重载服务。"
   SHARE_SERVER_IP="$(public_ip)"
   export SHARE_SERVER_IP
-  print_node_link "$user_proto" "$user_name" "$user_node_port" "$user_credential" "$user_value2" "$user_value3" "$user_value4" "$user_value5" "$user_value6"
+  print_node_link "$user_proto" "$user_name" "$user_port" "$user_credential" "$user_value2" "$user_value3" "$user_value4" "$user_value5" "$user_value6"
 }
 
 delete_multi_user() {
@@ -1860,6 +2070,7 @@ delete_multi_user() {
   chmod 600 "$USERS_DB"
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已删除并重载服务。"
 }
 
@@ -1898,6 +2109,7 @@ set_multi_user_enabled_state() {
   chmod 600 "$USERS_DB"
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已更新为 $action_text。"
 }
 
@@ -1920,7 +2132,7 @@ edit_multi_user_limits() {
     ui_error "未找到用户编号 $user_choice。"
     return 1
   fi
-  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note <<EOF
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
 $user_record
 EOF
 
@@ -1966,6 +2178,7 @@ EOF
   chmod 600 "$USERS_DB"
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 的到期/配额已更新。"
 }
 
@@ -1974,24 +2187,11 @@ refresh_multi_user_status() {
   screen_title "刷新用户状态"
   render_config
   restart_service
-  ui_success "已重新渲染配置。过期或禁用用户不会写入 Mihomo users。"
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
+  ui_success "已重新渲染配置。过期、禁用或超额用户不会写入独立 listener。"
 }
 
-fetch_mihomo_connections() {
-  secret_file="$CONFIG_DIR/controller.secret"
-  if [ ! -s "$secret_file" ]; then
-    ui_error "找不到 Mihomo API 密钥文件：$secret_file"
-    return 1
-  fi
-
-  ensure_curl
-  controller_secret="$(cat "$secret_file")"
-  curl -m 5 -fsS \
-    -H "Authorization: Bearer $controller_secret" \
-    "http://127.0.0.1:9090/connections"
-}
-
-update_user_traffic_from_connections() {
+update_user_traffic_from_iptables() {
   ensure_multi_user_enabled
   screen_title "刷新流量统计"
   if [ ! -s "$USERS_DB" ]; then
@@ -1999,67 +2199,79 @@ update_user_traffic_from_connections() {
     return 0
   fi
 
-  ensure_jq
+  ensure_user_ports
+  ensure_user_traffic_rules_ready || {
+    ui_error "无法准备 iptables 统计规则。请检查容器 NET_ADMIN 权限。"
+    return 1
+  }
   had_traffic_snapshot=1
-  [ -s "$TRAFFIC_DB" ] || had_traffic_snapshot=0
-  [ -f "$TRAFFIC_DB" ] || : > "$TRAFFIC_DB"
+  [ -f "$TRAFFIC_DB" ] || had_traffic_snapshot=0
+  [ -f "$TRAFFIC_DB" ] || reset_user_traffic_snapshot
   chmod 600 "$TRAFFIC_DB"
-  tmp_json="$(make_temp "$CONFIG_DIR/connections.XXXXXX")"
   tmp_current="$(make_temp "$CONFIG_DIR/traffic-current.XXXXXX")"
   tmp_deltas="$(make_temp "$CONFIG_DIR/traffic-delta.XXXXXX")"
   tmp_users="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
 
-  if ! fetch_mihomo_connections > "$tmp_json"; then
-    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
-    ui_error "无法读取 Mihomo /connections，请确认服务正在运行且 external-controller 可用。"
+  ipt="$(iptables_cmd)" || {
+    rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
+    ui_error "未找到 iptables，无法读取流量统计。"
     return 1
-  fi
-
-  if ! jq -r '
-    def user_field:
-      (.metadata.inboundUser // .metadata.user // .metadata.username //
-       .metadata.authUser // .metadata.account // .metadata.email //
-       .inboundUser // .user // .username // .authUser // .account // .email // "");
-    def clean_field: tostring | gsub("\\|"; "");
-    (.connections // [])[] |
-    ((.upload // .uplink // .up // 0) | tonumber? // 0) as $upload |
-    ((.download // .downlink // .down // 0) | tonumber? // 0) as $download |
-    [(.id // .ID // .uuid // .metadata.uid // ""), user_field, $upload, $download, ($upload + $download)] |
-    select(.[0] != "" and .[1] != "") |
-    map(clean_field) |
-    join("|")
-  ' "$tmp_json" > "$tmp_current"; then
-    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
-    ui_error "Mihomo /connections 返回内容不是可解析的 JSON。"
-    return 1
-  fi
+  }
+  {
+    "$ipt" -x -v -n -L "$TRAFFIC_CHAIN_IN" 2>/dev/null | awk '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      bytes = $2 + 0
+      port = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dpt:" && (i + 1) <= NF) port = $(i + 1)
+        else if ($i ~ /^dpt:[0-9]+$/) { port = $i; sub(/^dpt:/, "", port) }
+      }
+      if (port != "") print port "|" bytes
+    }'
+    "$ipt" -x -v -n -L "$TRAFFIC_CHAIN_OUT" 2>/dev/null | awk '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      bytes = $2 + 0
+      port = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "spt:" && (i + 1) <= NF) port = $(i + 1)
+        else if ($i ~ /^spt:[0-9]+$/) { port = $i; sub(/^spt:/, "", port) }
+      }
+      if (port != "") print port "|" bytes
+    }'
+  } | awk -F'|' '
+    {
+      total[$1] += $2
+    }
+    END {
+      for (port in total) print port "|" int(total[port])
+    }
+  ' > "$tmp_current"
 
   if [ ! -s "$tmp_current" ]; then
-    rm -f "$tmp_json" "$tmp_current" "$tmp_deltas" "$tmp_users"
-    ui_warn "当前 Mihomo API 未返回可识别的用户字段，无法在同一端口下精确区分每个用户流量。"
-    ui_warn "可手动查看：curl -H \"Authorization: Bearer \$(cat $CONFIG_DIR/controller.secret)\" http://127.0.0.1:9090/connections"
+    rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
+    ui_warn "当前没有可读取的用户端口计数。请确认用户端口已有连接，并检查 iptables 权限。"
     return 1
   fi
 
   if [ "$had_traffic_snapshot" = "0" ]; then
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
-    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
-    ui_warn "已建立当前连接快照。请在用户产生流量后再次刷新，才会累计增量。"
+    rm -f "$tmp_deltas" "$tmp_users"
+    ui_warn "已建立端口流量快照。请在用户产生流量后再次刷新，才会累计增量。"
     return 0
   fi
 
   awk -F'|' '
     BEGIN { OFS = FS }
     NR == FNR {
-      previous[$1] = $5
+      previous[$1] = $2
       next
     }
     {
-      current = $5 + 0
+      current = $2 + 0
       old = (($1 in previous) ? previous[$1] : 0) + 0
       delta = current - old
-      if (delta > 0) add[$2] += delta
+      if (delta > 0) add[$1] += delta
     }
     END {
       for (user in add) print user, int(add[user])
@@ -2069,7 +2281,7 @@ update_user_traffic_from_connections() {
   if [ ! -s "$tmp_deltas" ]; then
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
-    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
+    rm -f "$tmp_deltas" "$tmp_users"
     ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
     return 0
   fi
@@ -2082,8 +2294,7 @@ update_user_traffic_from_connections() {
     BEGIN { OFS = FS }
     NF >= 9 {
       user_delta = 0
-      if ($1 in delta) user_delta += delta[$1]
-      if ($4 in delta && $4 != $1) user_delta += delta[$4]
+      if (NF >= 11 && $11 in delta) user_delta += delta[$11]
       if (user_delta > 0) {
         old = $7 + 0
         $7 = int(old + user_delta)
@@ -2101,8 +2312,8 @@ update_user_traffic_from_connections() {
   if [ "${changed_count:-0}" = "0" ]; then
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
-    rm -f "$tmp_json" "$tmp_deltas" "$tmp_users"
-    ui_warn "API 返回了用户流量，但未匹配到 users.db 中的用户。请确认用户名与连接用户字段一致。"
+    rm -f "$tmp_deltas" "$tmp_users"
+    ui_warn "iptables 返回了端口流量，但未匹配到 users.db 中的用户端口。请确认连接走的是用户独立端口。"
     return 1
   fi
 
@@ -2110,13 +2321,18 @@ update_user_traffic_from_connections() {
   chmod 600 "$USERS_DB"
   mv "$tmp_current" "$TRAFFIC_DB"
   chmod 600 "$TRAFFIC_DB"
-  rm -f "$tmp_json" "$tmp_deltas"
+  rm -f "$tmp_deltas"
 
   ui_success "已更新 $changed_count 个用户的流量用量。"
   list_multi_users
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "已根据最新到期时间和流量配额重载服务。"
+}
+
+update_user_traffic_from_connections() {
+  update_user_traffic_from_iptables
 }
 
 reset_multi_user_traffic() {
@@ -2138,7 +2354,9 @@ reset_multi_user_traffic() {
     ui_error "未找到用户编号 $user_choice。"
     return 1
   fi
-  user_name="${user_record%%|*}"
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
+$user_record
+EOF
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   tmp_traffic="$(make_temp "$CONFIG_DIR/traffic.XXXXXX")"
   awk -F'|' -v n="$user_choice" '
@@ -2152,16 +2370,87 @@ reset_multi_user_traffic() {
   mv "$tmp_file" "$USERS_DB"
   chmod 600 "$USERS_DB"
   if [ -s "$TRAFFIC_DB" ]; then
-    awk -F'|' -v u="$user_name" '$2 != u { print }' "$TRAFFIC_DB" > "$tmp_traffic"
+    awk -F'|' -v p="$user_port" '
+      BEGIN { seen = 0 }
+      $1 == p { print p "|0"; seen = 1; next }
+      { print }
+      END { if (p != "" && seen == 0) print p "|0" }
+    ' "$TRAFFIC_DB" > "$tmp_traffic"
     mv "$tmp_traffic" "$TRAFFIC_DB"
   else
     rm -f "$tmp_traffic"
-    : > "$TRAFFIC_DB"
+    reset_user_traffic_snapshot
   fi
   chmod 600 "$TRAFFIC_DB"
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 的已用流量已重置。"
+}
+
+edit_multi_user_port() {
+  ensure_multi_user_enabled
+  screen_title "修改用户端口"
+  list_multi_users || return 0
+  ui_prompt "请输入要修改端口的用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
+$user_record
+EOF
+
+  ui_prompt "请输入新的用户监听端口（当前 ${user_port:-未分配}，留空自动生成）："
+  read -r new_port || true
+  if [ -z "$new_port" ]; then
+    new_port="$(unique_port)"
+  else
+    case "$new_port" in
+      ''|*[!0-9]*)
+        ui_error "端口必须是数字。"
+        return 1
+        ;;
+    esac
+    if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+      ui_error "端口范围必须为 1-65535。"
+      return 1
+    fi
+    if [ "$new_port" != "${user_port:-}" ] && port_in_use "$new_port"; then
+      ui_error "端口 $new_port 已被其他节点或用户占用。"
+      return 1
+    fi
+  fi
+
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  awk -F'|' -v n="$user_choice" -v port="$new_port" '
+    BEGIN { OFS = FS }
+    NF >= 9 {
+      i++
+      if (i == n) {
+        while (NF < 11) { $(NF + 1) = "" }
+        $11 = port
+      }
+    }
+    { print }
+  ' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  reset_user_traffic_snapshot
+  render_config
+  restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
+  ui_success "用户 $user_name 的端口已更新为 $new_port，流量快照已重置。"
 }
 
 show_user_subscription() {
@@ -2184,7 +2473,7 @@ show_user_subscription() {
     return 1
   fi
 
-  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note <<EOF
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
 $user_record
 EOF
 
@@ -2204,7 +2493,17 @@ EOF
 
   SHARE_SERVER_IP="$(public_ip)"
   export SHARE_SERVER_IP
-  user_link="$(node_share_link "$user_proto" "$user_name" "$node_port" "$user_credential" "$value2" "$value3" "$value4" "$value5" "$value6")"
+  case "${user_port:-}" in
+    ''|*[!0-9]*)
+      render_config
+      user_record="$(user_record_by_index "$user_choice")"
+      IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
+$user_record
+EOF
+      ;;
+  esac
+
+  user_link="$(node_share_link "$user_proto" "$user_name" "$user_port" "$user_credential" "$value2" "$value3" "$value4" "$value5" "$value6")"
   sub_base64="$(printf '%s\n' "$user_link" | base64_one_line)"
 
   cat <<EOF
@@ -2214,7 +2513,8 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
  用户：$user_name
  节点：$user_node
  协议：$user_proto
- 端口：$node_port
+ 用户端口：$user_port
+ 绑定节点端口：$node_port
 
  ${C_GREEN}[+] 用户节点链接${C_RESET}
 $user_link
@@ -2242,10 +2542,11 @@ multi_user_panel() {
  ${C_GREEN}8.${C_RESET} 刷新流量统计
  ${C_GREEN}9.${C_RESET} 重置用户流量
  ${C_GREEN}10.${C_RESET} 分发用户订阅
+ ${C_GREEN}11.${C_RESET} 修改用户端口
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    ui_prompt "请输入数字选择 (0-10)："
+    ui_prompt "请输入数字选择 (0-11)："
     read -r user_panel_choice || true
     case "$user_panel_choice" in
       1) add_multi_user; pause ;;
@@ -2258,8 +2559,9 @@ EOF
       8) update_user_traffic_from_connections; pause ;;
       9) reset_multi_user_traffic; pause ;;
       10) show_user_subscription; pause ;;
+      11) edit_multi_user_port; pause ;;
       0) return 0 ;;
-      *) ui_error "无效选择，请输入 0-10。"; pause ;;
+      *) ui_error "无效选择，请输入 0-11。"; pause ;;
     esac
   done
 }
@@ -2623,6 +2925,7 @@ uninstall_all() {
       ;;
   esac
 
+  cleanup_user_traffic_rules
   rm -f "$BIN_PATH" "$CLI_PATH"
   rm -rf "$CONFIG_DIR" "$LOG_DIR"
   ui_success "卸载完成。"

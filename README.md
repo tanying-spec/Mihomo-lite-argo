@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.8.2
+# ✨ Mihomo Lite - 一键配置脚本 V1.9.0
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **🚀 性能优化**：支持运行时参数调优、sysctl 网络优化和公网 IP 本地缓存。
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
-* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户增删、启停、到期时间、独立流量配额、手动流量统计和用户专属订阅分发。
+* **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
 
@@ -118,14 +118,15 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 mh install
 
 多用户管理只能在首次执行 `mh install` 安装 Mihomo 内核时选择是否启用。未启用时，主菜单不会显示 `77`，也不会创建 `/etc/mihomo/users.db`。
 
-启用后，用户会绑定到已有节点。脚本会把未过期、未禁用且未超出流量配额的用户写入对应 listener 的 `users` 配置中：
+启用后，用户会绑定到已有节点。脚本会为每个用户分配独立监听端口，并根据原节点参数渲染独立 listener：
 
 * VLESS + Reality / VLESS + WebSocket：为用户生成独立 UUID。
 * Hysteria2 / AnyTLS：为用户生成独立密码。
-* 到期、禁用和超出流量配额的用户会在重新渲染配置时自动从 Mihomo 配置中排除。
-* 菜单 `77` -> `8` 可通过 Mihomo `external-controller` 的 `/connections` 接口刷新用户流量统计，也可执行 `mh traffic`。
-* 第一次刷新会建立 `/etc/mihomo/traffic.db` 快照；后续刷新会按同一连接的上传 + 下载增量累加到用户 `used_bytes`。
-* 统计逻辑会优先按用户名匹配，也会尝试按用户 UUID / 密码匹配；若当前 Mihomo API 没有返回可识别字段，脚本不会按端口聚合流量，因为同一端口下无法精确区分每个用户。
-* 手动刷新只能统计两次刷新之间仍存在于 `/connections` 的活跃连接增量；如果需要更接近实时的配额控制，可以用 cron 定时执行 `mh traffic`。
+* 到期、禁用和超出流量配额的用户会在重新渲染配置时自动从独立 listener 中排除。
+* 菜单 `77` -> `8` 会通过 iptables 按用户端口刷新流量统计，也可执行 `mh traffic`。
+* 第一次刷新会建立 `/etc/mihomo/traffic.db` 快照；后续刷新会按用户端口的 TCP + UDP 入站和出站字节增量累加到 `used_bytes`。
+* 用户端口、启停状态、到期/配额或用户列表变化时，脚本会重建 iptables 统计规则并重置流量快照，已累计的 `used_bytes` 不会被清零。
+* 该方案不再依赖 Mihomo `/connections` 是否返回用户字段。LXC 容器需要具备 iptables / NET_ADMIN 权限，否则只能管理用户，无法读取端口流量计数。
 * 菜单 `77` -> `9` 可重置指定用户的已用流量，便于测试配额。
 * 菜单 `77` -> `10` 可输出指定用户的单节点链接和 Base64 订阅，也可执行 `mh sub-user`。
+* 菜单 `77` -> `11` 可修改指定用户的独立监听端口。
