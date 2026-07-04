@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.8.2"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -462,6 +462,14 @@ user_record_by_index() {
       if (i == n) { print; exit }
     }
   ' "$USERS_DB"
+}
+
+node_record_by_name_proto() {
+  lookup_name="$1"
+  lookup_proto="$2"
+  awk -F'|' -v name="$lookup_name" -v proto="$lookup_proto" '
+    $1 == proto && $2 == name { print; exit }
+  ' "$NODES_DB"
 }
 
 detect_arch() {
@@ -2156,6 +2164,67 @@ reset_multi_user_traffic() {
   ui_success "用户 $user_name 的已用流量已重置。"
 }
 
+show_user_subscription() {
+  ensure_multi_user_enabled
+  screen_title "分发用户订阅"
+  list_multi_users || return 0
+  ui_prompt "请输入要分发订阅的用户编号（0 返回）："
+  read -r user_choice || true
+  case "$user_choice" in
+    0) return 0 ;;
+    ''|*[!0-9]*)
+      ui_error "请输入有效数字。"
+      return 1
+      ;;
+  esac
+
+  user_record="$(user_record_by_index "$user_choice")"
+  if [ -z "$user_record" ]; then
+    ui_error "未找到用户编号 $user_choice。"
+    return 1
+  fi
+
+  IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note <<EOF
+$user_record
+EOF
+
+  if ! is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used"; then
+    ui_warn "用户 $user_name 当前未启用、已过期或已超出流量配额，订阅链接可能无法连接。"
+  fi
+
+  node_record="$(node_record_by_name_proto "$user_node" "$user_proto")"
+  if [ -z "$node_record" ]; then
+    ui_error "找不到用户绑定的原始节点：$user_node / $user_proto"
+    return 1
+  fi
+
+  IFS='|' read -r node_proto node_name node_port value1 value2 value3 value4 value5 value6 <<EOF
+$node_record
+EOF
+
+  SHARE_SERVER_IP="$(public_ip)"
+  export SHARE_SERVER_IP
+  user_link="$(node_share_link "$user_proto" "$user_name" "$node_port" "$user_credential" "$value2" "$value3" "$value4" "$value5" "$value6")"
+  sub_base64="$(printf '%s\n' "$user_link" | base64_one_line)"
+
+  cat <<EOF
+
+${C_CYAN}----------------------------------------------------${C_RESET}
+ ${C_YELLOW}[+] 用户信息${C_RESET}
+ 用户：$user_name
+ 节点：$user_node
+ 协议：$user_proto
+ 端口：$node_port
+
+ ${C_GREEN}[+] 用户节点链接${C_RESET}
+$user_link
+
+ ${C_GREEN}[+] 用户订阅 Base64${C_RESET}
+$sub_base64
+${C_CYAN}----------------------------------------------------${C_RESET}
+EOF
+}
+
 multi_user_panel() {
   need_root
   ensure_installed
@@ -2172,10 +2241,11 @@ multi_user_panel() {
  ${C_GREEN}7.${C_RESET} 刷新用户状态
  ${C_GREEN}8.${C_RESET} 刷新流量统计
  ${C_GREEN}9.${C_RESET} 重置用户流量
+ ${C_GREEN}10.${C_RESET} 分发用户订阅
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-    ui_prompt "请输入数字选择 (0-9)："
+    ui_prompt "请输入数字选择 (0-10)："
     read -r user_panel_choice || true
     case "$user_panel_choice" in
       1) add_multi_user; pause ;;
@@ -2187,8 +2257,9 @@ EOF
       7) refresh_multi_user_status; pause ;;
       8) update_user_traffic_from_connections; pause ;;
       9) reset_multi_user_traffic; pause ;;
+      10) show_user_subscription; pause ;;
       0) return 0 ;;
-      *) ui_error "无效选择，请输入 0-9。"; pause ;;
+      *) ui_error "无效选择，请输入 0-10。"; pause ;;
     esac
   done
 }
@@ -2644,6 +2715,7 @@ case "${1:-}" in
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;
+  sub-user|user-sub|user-subscription) need_root; ensure_installed; show_user_subscription ;;
   users|user|multi-user|77) multi_user_panel ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;
