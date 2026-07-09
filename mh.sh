@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.8"
+SCRIPT_VERSION="1.9.9"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -11,6 +11,8 @@ CONFIG_FILE="$CONFIG_DIR/config.yaml"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
 TRAFFIC_DB="$CONFIG_DIR/traffic.db"
+TRAFFIC_RULES_VERSION_FILE="$CONFIG_DIR/traffic-rules.version"
+TRAFFIC_RULES_VERSION="2"
 TRAFFIC_CHAIN="MIHOMO_LITE_USERS"
 TRAFFIC_CHAIN_IN="${TRAFFIC_CHAIN}_IN"
 TRAFFIC_CHAIN_OUT="${TRAFFIC_CHAIN}_OUT"
@@ -404,32 +406,32 @@ recommended_runtime() {
     *)
       if [ "$memory_mib" -le 192 ]; then
         recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 48)"
-        recommended_gogc="35"
+        recommended_gogc="75"
         cpu_count="$(cap_cpu_count "$cpu_count" 1)"
       elif [ "$memory_mib" -le 256 ]; then
         recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 64)"
-        recommended_gogc="50"
+        recommended_gogc="100"
         cpu_count="$(cap_cpu_count "$cpu_count" 1)"
       elif [ "$memory_mib" -le 512 ]; then
         recommended_mem="$(memlimit_from_percent "$memory_mib" 60 96 96)"
-        recommended_gogc="75"
+        recommended_gogc="125"
         cpu_count="$(cap_cpu_count "$cpu_count" 2)"
       elif [ "$memory_mib" -le 1024 ]; then
         recommended_mem="$(memlimit_from_percent "$memory_mib" 60 128 128)"
-        recommended_gogc="100"
+        recommended_gogc="150"
       else
         case "${os_id:-}" in
           alpine)
             recommended_mem="384MiB"
-            recommended_gogc="100"
+            recommended_gogc="150"
             ;;
           debian|ubuntu)
             recommended_mem="512MiB"
-            recommended_gogc="150"
+            recommended_gogc="200"
             ;;
           *)
             recommended_mem="512MiB"
-            recommended_gogc="125"
+            recommended_gogc="150"
             ;;
         esac
       fi
@@ -439,9 +441,9 @@ recommended_runtime() {
   esac
 
   case "${os_id:-}" in
-    alpine) printf '192MiB|75|%s' "$cpu_count" ;;
-    debian|ubuntu) printf '384MiB|150|%s' "$cpu_count" ;;
-    *) printf '256MiB|100|%s' "$cpu_count" ;;
+    alpine) printf '192MiB|125|%s' "$cpu_count" ;;
+    debian|ubuntu) printf '384MiB|200|%s' "$cpu_count" ;;
+    *) printf '256MiB|150|%s' "$cpu_count" ;;
   esac
 }
 
@@ -1609,6 +1611,12 @@ traffic_ipv6_enabled() {
   [ "$MIHOMO_IPV6" = "true" ]
 }
 
+traffic_rules_current() {
+  [ -r "$TRAFFIC_RULES_VERSION_FILE" ] || return 1
+  read -r traffic_rules_version < "$TRAFFIC_RULES_VERSION_FILE" || return 1
+  [ "$traffic_rules_version" = "$TRAFFIC_RULES_VERSION" ]
+}
+
 setup_user_traffic_rules_for_cmd() {
   traffic_fw="$1"
   traffic_family="$2"
@@ -1640,10 +1648,22 @@ append_user_traffic_rules_for_cmd() {
     [ -n "$user_name" ] || continue
     case "${user_port:-}" in ''|*[!0-9]*) continue ;; esac
     is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
-    "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
-    "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
-    "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
-    "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
+    case "$user_proto" in
+      hysteria2)
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
+        ;;
+      vless-reality|vless-ws|anytls)
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
+        ;;
+      *)
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
+        "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
+        ;;
+    esac
   done < "$USERS_DB"
 }
 
@@ -1728,6 +1748,8 @@ refresh_user_traffic_rules() {
     append_user_traffic_rules_for_cmd "$ip6t"
   fi
   reset_user_traffic_snapshot
+  printf '%s\n' "$TRAFFIC_RULES_VERSION" > "$TRAFFIC_RULES_VERSION_FILE"
+  chmod 600 "$TRAFFIC_RULES_VERSION_FILE"
 }
 
 refresh_user_traffic_rules_if_available() {
@@ -1738,6 +1760,10 @@ refresh_user_traffic_rules_if_available() {
 ensure_user_traffic_rules_ready() {
   ensure_iptables
   ipt="$(iptables_cmd)" || return 1
+  if ! traffic_rules_current; then
+    refresh_user_traffic_rules
+    return $?
+  fi
   if ! "$ipt" -L "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || ! "$ipt" -L "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; then
     refresh_user_traffic_rules
     return $?
@@ -1762,6 +1788,7 @@ cleanup_user_traffic_rules() {
   if command -v ip6tables >/dev/null 2>&1; then
     ip6t="$(ip6tables_cmd)" && cleanup_user_traffic_rules_for_cmd "$ip6t"
   fi
+  rm -f "$TRAFFIC_RULES_VERSION_FILE"
 }
 
 prompt_node_name() {
@@ -3263,29 +3290,36 @@ performance_tuning_menu() {
     *) detected_memory_text="${detected_memory_mib}MiB" ;;
   esac
   bandwidth_mode=0
+  cpu_mode=0
 
   stable_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
   bandwidth_gomaxprocs="$recommended_gomaxprocs"
+  cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
   case "$detected_memory_mib" in
     ''|*[!0-9]*)
       case "${os_id:-}" in
         alpine)
           stable_mem="128MiB"
-          stable_gogc="50"
+          stable_gogc="75"
           high_mem="256MiB"
-          high_gogc="125"
+          high_gogc="150"
           bandwidth_mem="192MiB"
-          bandwidth_gogc="75"
+          bandwidth_gogc="150"
           bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+          cpu_mem="192MiB"
+          cpu_gogc="150"
+          cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
           ;;
         *)
           stable_mem="192MiB"
-          stable_gogc="75"
+          stable_gogc="100"
           high_mem="512MiB"
-          high_gogc="150"
+          high_gogc="200"
           bandwidth_mem="384MiB"
-          bandwidth_gogc="100"
+          bandwidth_gogc="175"
           bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+          cpu_mem="384MiB"
+          cpu_gogc="175"
           ;;
       esac
       ;;
@@ -3293,20 +3327,35 @@ performance_tuning_menu() {
       stable_mem="$(memlimit_from_percent "$detected_memory_mib" 50 64 64 384)"
       high_mem="$(memlimit_from_percent "$detected_memory_mib" 70 128 64 1024)"
       bandwidth_mem="$(memlimit_from_percent "$detected_memory_mib" 60 96 96 768)"
+      cpu_mem="$(memlimit_from_percent "$detected_memory_mib" 60 96 96 768)"
       if [ "$detected_memory_mib" -le 256 ]; then
-        stable_gogc="35"
-        high_gogc="75"
-        bandwidth_gogc="50"
-        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
-      elif [ "$detected_memory_mib" -le 512 ]; then
-        stable_gogc="50"
-        high_gogc="100"
-        bandwidth_gogc="60"
-        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
-      else
+        bandwidth_mem="$(memlimit_from_percent "$detected_memory_mib" 60 64 64 512)"
+        cpu_mem="$bandwidth_mem"
         stable_gogc="75"
+        high_gogc="125"
+        bandwidth_gogc="125"
+        cpu_gogc="125"
+        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+      elif [ "$detected_memory_mib" -le 512 ]; then
+        stable_gogc="100"
         high_gogc="150"
-        bandwidth_gogc="100"
+        bandwidth_gogc="150"
+        cpu_gogc="150"
+        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+      elif [ "$detected_memory_mib" -le 1024 ]; then
+        stable_gogc="125"
+        high_gogc="175"
+        bandwidth_gogc="175"
+        cpu_gogc="175"
+        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+      else
+        stable_gogc="125"
+        high_gogc="200"
+        bandwidth_gogc="200"
+        cpu_gogc="200"
+        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
       fi
       ;;
   esac
@@ -3322,11 +3371,12 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}2.${C_RESET} 系统推荐模式        GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
  ${C_GREEN}3.${C_RESET} 高吞吐模式          GOMEMLIMIT=$high_mem  GOGC=$high_gogc  GOMAXPROCS=$recommended_gomaxprocs
  ${C_GREEN}4.${C_RESET} Alpine/LXC 稳速跑满带宽  GOMEMLIMIT=$bandwidth_mem  GOGC=$bandwidth_gogc  GOMAXPROCS=$bandwidth_gomaxprocs
- ${C_GREEN}5.${C_RESET} 自定义参数
+ ${C_GREEN}5.${C_RESET} 低 CPU 模式         GOMEMLIMIT=$cpu_mem  GOGC=$cpu_gogc  GOMAXPROCS=$cpu_gomaxprocs
+ ${C_GREEN}6.${C_RESET} 自定义参数
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-  ui_prompt "请输入数字选择 (0-5)："
+  ui_prompt "请输入数字选择 (0-6)："
   read -r perf_choice || true
 
   case "$perf_choice" in
@@ -3363,6 +3413,23 @@ EOF
       bandwidth_mode=1
       ;;
     5)
+      ui_warn "低 CPU 模式会提高 GOGC、限制 Go 调度线程，并重建轻量流量统计规则。"
+      ui_warn "如果需要极限压测带宽，优先使用 4 号模式关闭统计链。"
+      ui_prompt "确认应用低 CPU 模式？输入 y 确认："
+      read -r cpu_confirm || true
+      case "$cpu_confirm" in
+        y|Y|yes|YES) ;;
+        *)
+          ui_warn "已取消低 CPU 模式。"
+          return 0
+          ;;
+      esac
+      MIHOMO_GOMEMLIMIT="$cpu_mem"
+      MIHOMO_GOGC="$cpu_gogc"
+      MIHOMO_GOMAXPROCS="$cpu_gomaxprocs"
+      cpu_mode=1
+      ;;
+    6)
       default_mem="${MIHOMO_GOMEMLIMIT:-$recommended_mem}"
       default_gogc="${MIHOMO_GOGC:-$recommended_gogc}"
       default_gomaxprocs="${MIHOMO_GOMAXPROCS:-$recommended_gomaxprocs}"
@@ -3393,6 +3460,14 @@ EOF
     disable_traffic_auto_refresh >/dev/null 2>&1 || true
     cleanup_user_traffic_rules >/dev/null 2>&1 || true
     ui_success "已关闭自动流量统计并清理 iptables 统计规则。"
+  fi
+  if [ "$cpu_mode" = "1" ]; then
+    if multi_user_enabled; then
+      refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
+      ui_success "已按协议重建轻量流量统计规则。"
+    else
+      ui_success "多用户管理未启用，无需重建流量统计规则。"
+    fi
   fi
   ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS，GODEBUG=$MIHOMO_GODEBUG。"
 }
