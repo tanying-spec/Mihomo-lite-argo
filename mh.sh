@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.5"
+SCRIPT_VERSION="1.9.8"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -27,6 +27,8 @@ SYSCTL_CONF_FILE="/etc/sysctl.d/99-mihomo-lite.conf"
 MIHOMO_GOMEMLIMIT="${MIHOMO_GOMEMLIMIT:-}"
 MIHOMO_GOGC="${MIHOMO_GOGC:-}"
 MIHOMO_GOMAXPROCS="${MIHOMO_GOMAXPROCS:-}"
+MIHOMO_GODEBUG_DEFAULT="madvdontneed=1"
+MIHOMO_GODEBUG="${MIHOMO_GODEBUG:-}"
 MIHOMO_IPV6="${MIHOMO_IPV6:-}"
 MIHOMO_PREFER_IPV6="${MIHOMO_PREFER_IPV6:-}"
 MIHOMO_MULTI_USER="${MIHOMO_MULTI_USER:-}"
@@ -295,8 +297,147 @@ effective_cpu_count() {
   printf '%s\n' "$cpu_count"
 }
 
+cap_cpu_count() {
+  cap_value="${1:-1}"
+  cap_max="${2:-1}"
+  case "$cap_value" in ''|*[!0-9]*) cap_value=1 ;; esac
+  case "$cap_max" in ''|*[!0-9]*) cap_max=1 ;; esac
+  [ "$cap_value" -ge 1 ] || cap_value=1
+  [ "$cap_max" -ge 1 ] || cap_max=1
+  if [ "$cap_value" -gt "$cap_max" ]; then
+    printf '%s\n' "$cap_max"
+  else
+    printf '%s\n' "$cap_value"
+  fi
+}
+
+remember_memory_limit_value() {
+  memory_limit_value="$1"
+  case "$memory_limit_value" in ''|max|*[!0-9]*) return 0 ;; esac
+  memory_limit_value="$(awk -v value="$memory_limit_value" 'BEGIN {
+    max = 4 * 1024 * 1024 * 1024 * 1024;
+    if (value > 0 && value < max) printf "%.0f\n", value;
+  }')"
+  [ -n "$memory_limit_value" ] || return 0
+
+  if [ -z "${best_memory_limit:-}" ]; then
+    best_memory_limit="$memory_limit_value"
+  else
+    best_memory_limit="$(awk -v old="$best_memory_limit" -v new="$memory_limit_value" 'BEGIN {
+      if (new > 0 && new < old) printf "%.0f\n", new;
+      else printf "%.0f\n", old;
+    }')"
+  fi
+}
+
+remember_memory_limit_file() {
+  memory_limit_file="$1"
+  [ -r "$memory_limit_file" ] || return 0
+  memory_limit_value="$(cat "$memory_limit_file" 2>/dev/null | tr -d '[:space:]')"
+  remember_memory_limit_value "$memory_limit_value"
+}
+
+memory_limit_bytes() {
+  best_memory_limit=""
+  for memory_limit_file in \
+    /sys/fs/cgroup/memory.max \
+    /sys/fs/cgroup/memory/memory.limit_in_bytes \
+    /sys/fs/cgroup/memory.limit_in_bytes; do
+    remember_memory_limit_file "$memory_limit_file"
+  done
+
+  if [ -r /proc/self/cgroup ]; then
+    while IFS=: read -r cgroup_id cgroup_controllers cgroup_path; do
+      [ -n "$cgroup_id" ] || continue
+      case "${cgroup_path:-/}" in
+        /) cgroup_base="/sys/fs/cgroup" ;;
+        *) cgroup_base="/sys/fs/cgroup$cgroup_path" ;;
+      esac
+      case "$cgroup_controllers" in
+        '')
+          remember_memory_limit_file "$cgroup_base/memory.max"
+          ;;
+        *memory*)
+          remember_memory_limit_file "/sys/fs/cgroup/memory$cgroup_path/memory.limit_in_bytes"
+          remember_memory_limit_file "$cgroup_base/memory.limit_in_bytes"
+          ;;
+      esac
+    done < /proc/self/cgroup
+  fi
+
+  [ -n "$best_memory_limit" ] && printf '%s\n' "$best_memory_limit"
+}
+
+memory_limit_mib() {
+  memory_limit_value="$(memory_limit_bytes)"
+  case "$memory_limit_value" in ''|*[!0-9]*) return 0 ;; esac
+  awk -v value="$memory_limit_value" 'BEGIN { printf "%d\n", int(value / 1048576) }'
+}
+
+memlimit_from_percent() {
+  total_mib="$1"
+  percent_value="$2"
+  min_mib="$3"
+  headroom_mib="$4"
+  max_limit_mib="${5:-0}"
+  awk -v total="$total_mib" -v percent="$percent_value" -v min="$min_mib" -v headroom="$headroom_mib" -v maxlimit="$max_limit_mib" 'BEGIN {
+    value = int(total * percent / 100);
+    value = int(value / 16) * 16;
+    max = total - headroom;
+    if (max < 32) max = int(total * 70 / 100);
+    max = int(max / 16) * 16;
+    if (max < 32) max = 32;
+    if (value > max) value = max;
+    if (maxlimit > 0 && value > maxlimit) value = maxlimit;
+    if (value < min && min < max) value = min;
+    if (value < 32) value = 32;
+    printf "%dMiB", value;
+  }'
+}
+
 recommended_runtime() {
   cpu_count="$(effective_cpu_count)"
+  memory_mib="$(memory_limit_mib)"
+  case "$memory_mib" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      if [ "$memory_mib" -le 192 ]; then
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 48)"
+        recommended_gogc="35"
+        cpu_count="$(cap_cpu_count "$cpu_count" 1)"
+      elif [ "$memory_mib" -le 256 ]; then
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 64)"
+        recommended_gogc="50"
+        cpu_count="$(cap_cpu_count "$cpu_count" 1)"
+      elif [ "$memory_mib" -le 512 ]; then
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 96 96)"
+        recommended_gogc="75"
+        cpu_count="$(cap_cpu_count "$cpu_count" 2)"
+      elif [ "$memory_mib" -le 1024 ]; then
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 128 128)"
+        recommended_gogc="100"
+      else
+        case "${os_id:-}" in
+          alpine)
+            recommended_mem="384MiB"
+            recommended_gogc="100"
+            ;;
+          debian|ubuntu)
+            recommended_mem="512MiB"
+            recommended_gogc="150"
+            ;;
+          *)
+            recommended_mem="512MiB"
+            recommended_gogc="125"
+            ;;
+        esac
+      fi
+      printf '%s|%s|%s' "$recommended_mem" "$recommended_gogc" "$cpu_count"
+      return 0
+      ;;
+  esac
+
   case "${os_id:-}" in
     alpine) printf '192MiB|75|%s' "$cpu_count" ;;
     debian|ubuntu) printf '384MiB|150|%s' "$cpu_count" ;;
@@ -317,12 +458,17 @@ load_runtime_tuning() {
         MIHOMO_GOMAXPROCS)
           [ -n "$MIHOMO_GOMAXPROCS" ] || MIHOMO_GOMAXPROCS="$runtime_value"
           ;;
+        MIHOMO_GODEBUG)
+          [ -n "$MIHOMO_GODEBUG" ] || MIHOMO_GODEBUG="$runtime_value"
+          ;;
       esac
     done < "$RUNTIME_ENV_FILE"
   fi
+  [ -n "$MIHOMO_GODEBUG" ] || MIHOMO_GODEBUG="$MIHOMO_GODEBUG_DEFAULT"
 }
 
 validate_runtime_tuning() {
+  [ -n "$MIHOMO_GODEBUG" ] || MIHOMO_GODEBUG="$MIHOMO_GODEBUG_DEFAULT"
   case "$MIHOMO_GOGC" in
     ''|*[!0-9]*)
       red "GOGC 必须是数字。"
@@ -345,6 +491,12 @@ validate_runtime_tuning() {
     red "GOMAXPROCS 必须大于 0。"
     exit 1
   fi
+  case "$MIHOMO_GODEBUG" in
+    *[!A-Za-z0-9_=,.:+-]*)
+      red "GODEBUG 只能包含字母、数字和常见分隔符。"
+      exit 1
+      ;;
+  esac
 }
 
 write_runtime_tuning() {
@@ -353,6 +505,7 @@ write_runtime_tuning() {
     printf 'MIHOMO_GOMEMLIMIT=%s\n' "$MIHOMO_GOMEMLIMIT"
     printf 'MIHOMO_GOGC=%s\n' "$MIHOMO_GOGC"
     printf 'MIHOMO_GOMAXPROCS=%s\n' "$MIHOMO_GOMAXPROCS"
+    printf 'MIHOMO_GODEBUG=%s\n' "$MIHOMO_GODEBUG"
   } > "$RUNTIME_ENV_FILE"
   chmod 600 "$RUNTIME_ENV_FILE"
 }
@@ -368,8 +521,13 @@ prompt_runtime_tuning() {
   recommended_gogc="${recommended_rest%%|*}"
   recommended_gomaxprocs="${recommended_rest#*|}"
   [ "$recommended_gomaxprocs" = "$recommended_rest" ] && recommended_gomaxprocs="$(effective_cpu_count)"
+  detected_memory_mib="$(memory_limit_mib)"
 
   ui_section "设置 Mihomo 运行参数"
+  case "$detected_memory_mib" in
+    ''|*[!0-9]*) ui_warn "未检测到明确的容器内存限制，将使用系统类型推荐值。" ;;
+    *) ui_warn "检测到可用内存约 ${detected_memory_mib}MiB，推荐值已按低内存容器预留余量。" ;;
+  esac
   if [ -z "$env_mem" ]; then
     default_mem="${MIHOMO_GOMEMLIMIT:-$recommended_mem}"
     ui_prompt "请输入 GOMEMLIMIT（默认 $default_mem，推荐 $recommended_mem）："
@@ -556,6 +714,21 @@ is_user_active() {
   expire_epoch="$(date_to_epoch "$user_expire")"
   [ -n "$today_epoch" ] && [ -n "$expire_epoch" ] || return 1
   [ "$expire_epoch" -ge "$today_epoch" ]
+}
+
+quota_exceeded_user_count() {
+  [ -s "$USERS_DB" ] || {
+    printf '0\n'
+    return 0
+  }
+  awk -F'|' '
+    NF >= 9 {
+      quota = $6 + 0
+      used = $7 + 0
+      if ($8 == "1" && quota > 0 && used >= quota) count++
+    }
+    END { print count + 0 }
+  ' "$USERS_DB"
 }
 
 format_bytes() {
@@ -1265,9 +1438,10 @@ Type=simple
 Environment=GOMEMLIMIT=$MIHOMO_GOMEMLIMIT
 Environment=GOGC=$MIHOMO_GOGC
 Environment=GOMAXPROCS=$MIHOMO_GOMAXPROCS
+Environment=GODEBUG=$MIHOMO_GODEBUG
 ExecStart=$BIN_PATH -d $CONFIG_DIR -f $CONFIG_FILE
 Restart=on-failure
-RestartSec=5s
+RestartSec=2s
 LimitNOFILE=1048576
 
 [Install]
@@ -1288,12 +1462,13 @@ command_args="-d $CONFIG_DIR -f $CONFIG_FILE"
 output_log="$LOG_DIR/${SERVICE_NAME}.log"
 error_log="$LOG_DIR/${SERVICE_NAME}.err"
 supervisor="supervise-daemon"
-respawn_delay=5
+respawn_delay=2
 respawn_max=0
 rc_ulimit="-n 1048576"
 export GOMEMLIMIT="$MIHOMO_GOMEMLIMIT"
 export GOGC="$MIHOMO_GOGC"
 export GOMAXPROCS="$MIHOMO_GOMAXPROCS"
+export GODEBUG="$MIHOMO_GODEBUG"
 
 depend() {
   need net
@@ -1408,6 +1583,9 @@ port_in_use() {
 
 ensure_iptables() {
   command -v iptables >/dev/null 2>&1 || install_packages iptables
+  if traffic_ipv6_enabled && ! command -v ip6tables >/dev/null 2>&1; then
+    install_packages iptables
+  fi
 }
 
 iptables_cmd() {
@@ -1416,6 +1594,95 @@ iptables_cmd() {
     return 0
   fi
   return 1
+}
+
+ip6tables_cmd() {
+  if command -v ip6tables >/dev/null 2>&1; then
+    printf 'ip6tables'
+    return 0
+  fi
+  return 1
+}
+
+traffic_ipv6_enabled() {
+  load_network_settings
+  [ "$MIHOMO_IPV6" = "true" ]
+}
+
+setup_user_traffic_rules_for_cmd() {
+  traffic_fw="$1"
+  traffic_family="$2"
+
+  "$traffic_fw" -N "$TRAFFIC_CHAIN_IN" 2>/dev/null || true
+  "$traffic_fw" -N "$TRAFFIC_CHAIN_OUT" 2>/dev/null || true
+  "$traffic_fw" -F "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
+    ui_error "无法写入 $traffic_family 统计链。LXC 容器可能缺少 NET_ADMIN 权限。"
+    return 1
+  }
+  "$traffic_fw" -F "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
+    ui_error "无法写入 $traffic_family 统计链。LXC 容器可能缺少 NET_ADMIN 权限。"
+    return 1
+  }
+  "$traffic_fw" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$traffic_fw" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
+    ui_error "无法挂载 $traffic_family 入站统计链。请检查容器权限。"
+    return 1
+  }
+  "$traffic_fw" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$traffic_fw" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
+    ui_error "无法挂载 $traffic_family 出站统计链。请检查容器权限。"
+    return 1
+  }
+}
+
+append_user_traffic_rules_for_cmd() {
+  traffic_fw="$1"
+  [ -s "$USERS_DB" ] || return 0
+  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
+    [ -n "$user_name" ] || continue
+    case "${user_port:-}" in ''|*[!0-9]*) continue ;; esac
+    is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
+    "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
+    "$traffic_fw" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
+    "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
+    "$traffic_fw" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
+  done < "$USERS_DB"
+}
+
+traffic_counter_lines_for_cmd() {
+  traffic_fw="$1"
+  "$traffic_fw" -x -v -n -L "$TRAFFIC_CHAIN_IN" 2>/dev/null | awk '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      bytes = $2 + 0
+      port = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dpt:" && (i + 1) <= NF) port = $(i + 1)
+        else if ($i ~ /^dpt:[0-9]+$/) { port = $i; sub(/^dpt:/, "", port) }
+      }
+      if (port != "") print port "|" bytes
+    }'
+  "$traffic_fw" -x -v -n -L "$TRAFFIC_CHAIN_OUT" 2>/dev/null | awk '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      bytes = $2 + 0
+      port = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "spt:" && (i + 1) <= NF) port = $(i + 1)
+        else if ($i ~ /^spt:[0-9]+$/) { port = $i; sub(/^spt:/, "", port) }
+      }
+      if (port != "") print port "|" bytes
+    }'
+}
+
+cleanup_user_traffic_rules_for_cmd() {
+  traffic_fw="$1"
+  while "$traffic_fw" -C INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1; do
+    "$traffic_fw" -D INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || break
+  done
+  while "$traffic_fw" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; do
+    "$traffic_fw" -D OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || break
+  done
+  "$traffic_fw" -F "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
+  "$traffic_fw" -F "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
+  "$traffic_fw" -X "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
+  "$traffic_fw" -X "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
 }
 
 reset_user_traffic_snapshot() {
@@ -1439,38 +1706,27 @@ refresh_user_traffic_rules() {
   ensure_user_ports
   ensure_iptables
   ipt="$(iptables_cmd)" || {
-    ui_error "未找到 iptables，无法启用端口级流量统计。"
+    ui_error "未找到 iptables，无法启用 IPv4 端口级流量统计。"
     return 1
   }
+  ip6t=""
+  if traffic_ipv6_enabled; then
+    ip6t="$(ip6tables_cmd)" || {
+      ui_error "IPv6 已开启，但未找到 ip6tables，无法统计 IPv6 用户流量。"
+      return 1
+    }
+  fi
 
-  "$ipt" -N "$TRAFFIC_CHAIN_IN" 2>/dev/null || true
-  "$ipt" -N "$TRAFFIC_CHAIN_OUT" 2>/dev/null || true
-  "$ipt" -F "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
-    ui_error "无法写入 iptables。LXC 容器可能缺少 NET_ADMIN 权限。"
-    return 1
-  }
-  "$ipt" -F "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
-    ui_error "无法写入 iptables。LXC 容器可能缺少 NET_ADMIN 权限。"
-    return 1
-  }
-  "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$ipt" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || {
-    ui_error "无法挂载 iptables 入站统计链。请检查容器权限。"
-    return 1
-  }
-  "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$ipt" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || {
-    ui_error "无法挂载 iptables 出站统计链。请检查容器权限。"
-    return 1
-  }
+  setup_user_traffic_rules_for_cmd "$ipt" "IPv4" || return 1
 
-  while IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra; do
-    [ -n "$user_name" ] || continue
-    case "${user_port:-}" in ''|*[!0-9]*) continue ;; esac
-    is_user_active "$user_enabled" "$user_expire" "$user_quota" "$user_used" || continue
-    "$ipt" -A "$TRAFFIC_CHAIN_IN" -p tcp --dport "$user_port" 2>/dev/null || true
-    "$ipt" -A "$TRAFFIC_CHAIN_IN" -p udp --dport "$user_port" 2>/dev/null || true
-    "$ipt" -A "$TRAFFIC_CHAIN_OUT" -p tcp --sport "$user_port" 2>/dev/null || true
-    "$ipt" -A "$TRAFFIC_CHAIN_OUT" -p udp --sport "$user_port" 2>/dev/null || true
-  done < "$USERS_DB"
+  if [ -n "$ip6t" ]; then
+    setup_user_traffic_rules_for_cmd "$ip6t" "IPv6" || return 1
+  fi
+
+  append_user_traffic_rules_for_cmd "$ipt"
+  if [ -n "$ip6t" ]; then
+    append_user_traffic_rules_for_cmd "$ip6t"
+  fi
   reset_user_traffic_snapshot
 }
 
@@ -1488,21 +1744,24 @@ ensure_user_traffic_rules_ready() {
   fi
   "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$ipt" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || return 1
   "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$ipt" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || return 1
+  if traffic_ipv6_enabled; then
+    ip6t="$(ip6tables_cmd)" || return 1
+    if ! "$ip6t" -L "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || ! "$ip6t" -L "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; then
+      refresh_user_traffic_rules
+      return $?
+    fi
+    "$ip6t" -C INPUT -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || "$ip6t" -I INPUT 1 -j "$TRAFFIC_CHAIN_IN" 2>/dev/null || return 1
+    "$ip6t" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || "$ip6t" -I OUTPUT 1 -j "$TRAFFIC_CHAIN_OUT" 2>/dev/null || return 1
+  fi
 }
 
 cleanup_user_traffic_rules() {
-  command -v iptables >/dev/null 2>&1 || return 0
-  ipt="$(iptables_cmd)" || return 0
-  while "$ipt" -C INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1; do
-    "$ipt" -D INPUT -j "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || break
-  done
-  while "$ipt" -C OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1; do
-    "$ipt" -D OUTPUT -j "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || break
-  done
-  "$ipt" -F "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
-  "$ipt" -F "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
-  "$ipt" -X "$TRAFFIC_CHAIN_IN" >/dev/null 2>&1 || true
-  "$ipt" -X "$TRAFFIC_CHAIN_OUT" >/dev/null 2>&1 || true
+  if command -v iptables >/dev/null 2>&1; then
+    ipt="$(iptables_cmd)" && cleanup_user_traffic_rules_for_cmd "$ipt"
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6t="$(ip6tables_cmd)" && cleanup_user_traffic_rules_for_cmd "$ip6t"
+  fi
 }
 
 prompt_node_name() {
@@ -2420,6 +2679,7 @@ refresh_multi_user_status() {
 
 update_user_traffic_from_iptables() {
   traffic_quiet="${1:-0}"
+  traffic_enforce="${2:-1}"
   ensure_multi_user_enabled
   [ "$traffic_quiet" = "1" ] || screen_title "刷新流量统计"
   if [ ! -s "$USERS_DB" ]; then
@@ -2442,30 +2702,22 @@ update_user_traffic_from_iptables() {
 
   ipt="$(iptables_cmd)" || {
     rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
-    [ "$traffic_quiet" = "1" ] || ui_error "未找到 iptables，无法读取流量统计。"
+    [ "$traffic_quiet" = "1" ] || ui_error "未找到 iptables，无法读取 IPv4 流量统计。"
     return 1
   }
+  ip6t=""
+  if traffic_ipv6_enabled; then
+    ip6t="$(ip6tables_cmd)" || {
+      rm -f "$tmp_current" "$tmp_deltas" "$tmp_users"
+      [ "$traffic_quiet" = "1" ] || ui_error "IPv6 已开启，但未找到 ip6tables，无法读取 IPv6 流量统计。"
+      return 1
+    }
+  fi
   {
-    "$ipt" -x -v -n -L "$TRAFFIC_CHAIN_IN" 2>/dev/null | awk '
-    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-      bytes = $2 + 0
-      port = ""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "dpt:" && (i + 1) <= NF) port = $(i + 1)
-        else if ($i ~ /^dpt:[0-9]+$/) { port = $i; sub(/^dpt:/, "", port) }
-      }
-      if (port != "") print port "|" bytes
-    }'
-    "$ipt" -x -v -n -L "$TRAFFIC_CHAIN_OUT" 2>/dev/null | awk '
-    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-      bytes = $2 + 0
-      port = ""
-      for (i = 1; i <= NF; i++) {
-        if ($i == "spt:" && (i + 1) <= NF) port = $(i + 1)
-        else if ($i ~ /^spt:[0-9]+$/) { port = $i; sub(/^spt:/, "", port) }
-      }
-      if (port != "") print port "|" bytes
-    }'
+    traffic_counter_lines_for_cmd "$ipt"
+    if [ -n "$ip6t" ]; then
+      traffic_counter_lines_for_cmd "$ip6t"
+    fi
   } | awk -F'|' '
     {
       total[$1] += $2
@@ -2510,6 +2762,14 @@ update_user_traffic_from_iptables() {
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
     rm -f "$tmp_deltas" "$tmp_users"
+    quota_crossed_count="$(quota_exceeded_user_count)"
+    if [ "$traffic_enforce" = "1" ] && [ "${quota_crossed_count:-0}" != "0" ]; then
+      render_config
+      restart_service
+      refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
+      [ "$traffic_quiet" = "1" ] || ui_success "检测到 $quota_crossed_count 个用户已达到流量配额，已重载服务并移除对应 listener。"
+      return 0
+    fi
     [ "$traffic_quiet" = "1" ] || ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
     return 0
   fi
@@ -2563,6 +2823,10 @@ EOF
   [ "$traffic_quiet" = "1" ] || ui_success "已更新 $changed_count 个用户的流量用量。"
   [ "$traffic_quiet" = "1" ] || list_multi_users
   if [ "$quota_crossed_count" != "0" ]; then
+    if [ "$traffic_enforce" != "1" ]; then
+      [ "$traffic_quiet" = "1" ] || ui_warn "检测到 $quota_crossed_count 个用户达到流量配额，本次只记录用量，不重启 Mihomo。"
+      return 0
+    fi
     render_config
     restart_service
     refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
@@ -2573,7 +2837,7 @@ EOF
 }
 
 update_user_traffic_from_connections() {
-  update_user_traffic_from_iptables "${1:-0}"
+  update_user_traffic_from_iptables "${1:-0}" "${2:-1}"
 }
 
 traffic_auto_cron_line() {
@@ -2605,7 +2869,7 @@ run_traffic_auto_refresh() {
   fi
   printf '%s\n' "$$" > "$TRAFFIC_LOCK_DIR/pid"
   trap 'rm -f "$TRAFFIC_LOCK_DIR/pid"; rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
-  update_user_traffic_from_connections 1
+  update_user_traffic_from_connections 1 0
 }
 
 enable_traffic_auto_refresh() {
@@ -2956,6 +3220,28 @@ apply_runtime_service() {
   esac
 }
 
+apply_saved_runtime_service() {
+  need_root
+  ensure_installed
+  detect_os
+  load_runtime_tuning
+  recommended="$(recommended_runtime)"
+  recommended_mem="${recommended%%|*}"
+  recommended_rest="${recommended#*|}"
+  recommended_gogc="${recommended_rest%%|*}"
+  recommended_gomaxprocs="${recommended_rest#*|}"
+  [ "$recommended_gomaxprocs" = "$recommended_rest" ] && recommended_gomaxprocs="$(effective_cpu_count)"
+
+  [ -n "$MIHOMO_GOMEMLIMIT" ] || MIHOMO_GOMEMLIMIT="$recommended_mem"
+  [ -n "$MIHOMO_GOGC" ] || MIHOMO_GOGC="$recommended_gogc"
+  [ -n "$MIHOMO_GOMAXPROCS" ] || MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
+  [ -n "$MIHOMO_GODEBUG" ] || MIHOMO_GODEBUG="$MIHOMO_GODEBUG_DEFAULT"
+
+  validate_runtime_tuning
+  write_runtime_tuning
+  apply_runtime_service
+}
+
 performance_tuning_menu() {
   need_root
   ensure_installed
@@ -2970,32 +3256,72 @@ performance_tuning_menu() {
   current_mem="${MIHOMO_GOMEMLIMIT:-未设置}"
   current_gogc="${MIHOMO_GOGC:-未设置}"
   current_gomaxprocs="${MIHOMO_GOMAXPROCS:-未设置}"
+  current_godebug="${MIHOMO_GODEBUG:-$MIHOMO_GODEBUG_DEFAULT}"
+  detected_memory_mib="$(memory_limit_mib)"
+  case "$detected_memory_mib" in
+    ''|*[!0-9]*) detected_memory_text="未检测到" ;;
+    *) detected_memory_text="${detected_memory_mib}MiB" ;;
+  esac
   bandwidth_mode=0
 
-  case "${os_id:-}" in
-    alpine)
-      high_mem="256MiB"
-      high_gogc="125"
-      bandwidth_mem="256MiB"
-      bandwidth_gogc="150"
+  stable_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+  bandwidth_gomaxprocs="$recommended_gomaxprocs"
+  case "$detected_memory_mib" in
+    ''|*[!0-9]*)
+      case "${os_id:-}" in
+        alpine)
+          stable_mem="128MiB"
+          stable_gogc="50"
+          high_mem="256MiB"
+          high_gogc="125"
+          bandwidth_mem="192MiB"
+          bandwidth_gogc="75"
+          bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+          ;;
+        *)
+          stable_mem="192MiB"
+          stable_gogc="75"
+          high_mem="512MiB"
+          high_gogc="150"
+          bandwidth_mem="384MiB"
+          bandwidth_gogc="100"
+          bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+          ;;
+      esac
       ;;
     *)
-      high_mem="512MiB"
-      high_gogc="200"
-      bandwidth_mem="768MiB"
-      bandwidth_gogc="250"
+      stable_mem="$(memlimit_from_percent "$detected_memory_mib" 50 64 64 384)"
+      high_mem="$(memlimit_from_percent "$detected_memory_mib" 70 128 64 1024)"
+      bandwidth_mem="$(memlimit_from_percent "$detected_memory_mib" 60 96 96 768)"
+      if [ "$detected_memory_mib" -le 256 ]; then
+        stable_gogc="35"
+        high_gogc="75"
+        bandwidth_gogc="50"
+        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+      elif [ "$detected_memory_mib" -le 512 ]; then
+        stable_gogc="50"
+        high_gogc="100"
+        bandwidth_gogc="60"
+        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+      else
+        stable_gogc="75"
+        high_gogc="150"
+        bandwidth_gogc="100"
+      fi
       ;;
   esac
 
   screen_title "性能优化菜单"
   cat <<EOF
  当前参数：GOMEMLIMIT=$current_mem  GOGC=$current_gogc  GOMAXPROCS=$current_gomaxprocs
+ 当前 GODEBUG：$current_godebug
+ 检测内存：$detected_memory_text
  系统推荐：GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_GREEN}1.${C_RESET} 低配稳定模式        GOMEMLIMIT=192MiB  GOGC=75   GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}1.${C_RESET} 低内存稳连模式      GOMEMLIMIT=$stable_mem  GOGC=$stable_gogc   GOMAXPROCS=$stable_gomaxprocs
  ${C_GREEN}2.${C_RESET} 系统推荐模式        GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
  ${C_GREEN}3.${C_RESET} 高吞吐模式          GOMEMLIMIT=$high_mem  GOGC=$high_gogc  GOMAXPROCS=$recommended_gomaxprocs
- ${C_GREEN}4.${C_RESET} Alpine/LXC 跑满带宽  GOMEMLIMIT=$bandwidth_mem  GOGC=$bandwidth_gogc  GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}4.${C_RESET} Alpine/LXC 稳速跑满带宽  GOMEMLIMIT=$bandwidth_mem  GOGC=$bandwidth_gogc  GOMAXPROCS=$bandwidth_gomaxprocs
  ${C_GREEN}5.${C_RESET} 自定义参数
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
@@ -3005,9 +3331,9 @@ EOF
 
   case "$perf_choice" in
     1)
-      MIHOMO_GOMEMLIMIT="192MiB"
-      MIHOMO_GOGC="75"
-      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
+      MIHOMO_GOMEMLIMIT="$stable_mem"
+      MIHOMO_GOGC="$stable_gogc"
+      MIHOMO_GOMAXPROCS="$stable_gomaxprocs"
       ;;
     2)
       MIHOMO_GOMEMLIMIT="$recommended_mem"
@@ -3033,7 +3359,7 @@ EOF
       esac
       MIHOMO_GOMEMLIMIT="$bandwidth_mem"
       MIHOMO_GOGC="$bandwidth_gogc"
-      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
+      MIHOMO_GOMAXPROCS="$bandwidth_gomaxprocs"
       bandwidth_mode=1
       ;;
     5)
@@ -3068,7 +3394,7 @@ EOF
     cleanup_user_traffic_rules >/dev/null 2>&1 || true
     ui_success "已关闭自动流量统计并清理 iptables 统计规则。"
   fi
-  ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS。"
+  ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS，GODEBUG=$MIHOMO_GODEBUG。"
 }
 
 apply_sysctl_value() {
@@ -3284,6 +3610,22 @@ update_script() {
   chmod +x "$tmp_file"
   mv "$tmp_file" "$CLI_PATH"
   ui_success "脚本更新完成。重新输入 mh 可打开新版管理面板。"
+  if [ -x "$BIN_PATH" ] && [ -f "$CONFIG_FILE" ]; then
+    ui_prompt "是否立即使用新版脚本重写服务运行参数并重启 Mihomo？[y/N]："
+    read -r apply_runtime_confirm || true
+    case "$apply_runtime_confirm" in
+      y|Y|yes|YES)
+        if "$CLI_PATH" apply-runtime >/dev/null 2>&1; then
+          ui_success "已重写服务运行参数并重启 Mihomo。"
+        else
+          ui_warn "服务运行参数未自动应用，请手动执行 mh apply-runtime 或 mh 44。"
+        fi
+        ;;
+      *)
+        ui_warn "如本次更新包含运行参数或服务模板变化，请执行 mh apply-runtime 或 mh 44 后生效。"
+        ;;
+    esac
+  fi
 }
 
 uninstall_all() {
@@ -3405,6 +3747,7 @@ case "${1:-}" in
   combo|batch|22) add_combo_nodes ;;
   rename|rename-all|33) rename_all_nodes ;;
   perf|performance|tune|44) performance_tuning_menu ;;
+  apply-runtime|runtime-apply) apply_saved_runtime_service ;;
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;

@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.9.5
+# ✨ Mihomo Lite - 一键配置脚本 V1.9.8
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -33,11 +33,11 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **🔗 节点生成**：一键生成代理节点，并自动输出可复制导入的节点链接。
 * **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除、一键清空和批量重命名。
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
-* **🚀 性能优化**：支持运行时参数调优、Alpine/LXC 跑满带宽模式、sysctl 网络优化和公网 IP 本地缓存。
+* **🚀 性能优化**：支持运行时参数调优、低内存稳连模式、Alpine/LXC 稳速跑满带宽模式、sysctl 网络优化和公网 IP 本地缓存。
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
 * **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
-* **🔄 无缝升级**：支持一键拉取并更新管理脚本自身。
+* **🔄 无缝升级**：支持一键拉取并更新管理脚本自身，更新后可自动重写服务运行参数。
 
 ### 🛡️ 支持的代理协议
 
@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 
 菜单输入 `33` 可批量重命名所有节点，格式为 `国家旗帜Emoji国家全称-服务商名称-节点协议`，国家旗帜会根据输入的国家自动识别。
 
-菜单输入 `44` 可调整 Mihomo 的 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`，支持低配稳定、系统推荐、高吞吐、Alpine/LXC 跑满带宽和自定义参数。
+菜单输入 `44` 可调整 Mihomo 的 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`，支持低内存稳连、系统推荐、高吞吐、Alpine/LXC 稳速跑满带宽和自定义参数。
 
 菜单输入 `55` 可尝试应用 sysctl 网络优化，包括 BBR、队列、TCP/UDP 缓冲和本地端口范围。LXC 容器可能无法写入部分参数，脚本会自动跳过无权限项目。
 
@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 | **流量快照** | `/etc/mihomo/traffic.db` | 记录活跃连接的上次统计快照 |
 | **自动刷新任务** | root crontab | 仅启用自动流量刷新时写入 |
 | **功能开关** | `/etc/mihomo/features.env` | 记录是否启用多用户管理 |
-| **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT`、`GOGC` 与 `GOMAXPROCS` |
+| **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT`、`GOGC`、`GOMAXPROCS` 与 `GODEBUG` |
 | **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
 | **公网 IP 缓存** | `/etc/mihomo/public.ip` | 缓存 IPv4 / IPv6 分享地址，减少外部 API 请求 |
 | **日志目录** | `/var/log/mihomo/` | 存储服务的运行与连接日志 |
@@ -90,19 +90,20 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 
 * 默认关闭 `fake-ip` 缓存，DNS 使用 `redir-host`。
 * 默认日志级别为 `warning`，减少高流量时的日志开销。
-* 执行 `mh install` 时会提示填写 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`。
+* 执行 `mh install` 时会提示填写 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`，并自动写入 `GODEBUG=madvdontneed=1` 以降低 Go 运行时长期保留的 RSS。
+* `GOMEMLIMIT` 会优先按 cgroup v2/v1 硬内存限制生成推荐值，给系统、TLS/QUIC 缓冲和内核网络缓冲预留余量；不会把 `memory.high` 或可能显示宿主机内存的 `/proc/meminfo` 当作容器限制。
 * `GOMAXPROCS` 会优先按 cgroup CPU 配额推荐，避免 LXC 容器误用宿主机 CPU 数导致调度开销过高。
-* 后续可通过菜单 `44` 随时切换运行时性能档位；其中 Alpine/LXC 跑满带宽模式会关闭自动流量统计并移除 iptables 统计规则，减少包路径开销。
+* 后续可通过菜单 `44` 随时切换运行时性能档位；其中 Alpine/LXC 稳速跑满带宽模式会关闭自动流量统计并移除 iptables 统计规则，减少包路径开销。
 * 菜单 `55` 可尝试应用网络栈优化；容器无权限的 sysctl 项会被跳过。
-* Alpine 推荐 `192MiB/75`，Debian / Ubuntu 推荐 `384MiB/150`；`GOMAXPROCS` 会按容器 CPU 配额推荐，直接回车即可采用推荐值。
+* 未检测到明确内存限制时，Alpine 使用更保守推荐值，Debian / Ubuntu 使用略高推荐值；检测到 128/256/512MiB 等小内存容器时会自动下调 `GOMEMLIMIT` 和 `GOGC`。
 
 也可以通过环境变量直接指定并重写服务：
 
 ```sh
-MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 MIHOMO_GOMAXPROCS=2 mh install
+MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 MIHOMO_GOMAXPROCS=2 MIHOMO_GODEBUG=madvdontneed=1 mh install
 ```
 
-如果容器内存极低并且仍然崩溃，可再收紧到 `128MiB/50` 或 `192MiB/75`。
+如果容器内存极低并且多线程测速后仍然断流，优先在菜单 `44` 使用 `低内存稳连模式`；需要压测带宽时再使用 `Alpine/LXC 稳速跑满带宽模式`，该模式会暂停自动流量统计和 iptables 统计链。
 
 节点链接里的公网 IP 会缓存到 `/etc/mihomo/public.ip`。如果 VPS 更换了出口 IP，删除该文件后重新查看或生成节点即可刷新。
 
@@ -125,13 +126,14 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 MIHOMO_GOMAXPROCS=2 mh install
 * VLESS + Reality / VLESS + WebSocket：为用户生成独立 UUID。
 * Hysteria2 / AnyTLS：为用户生成独立密码。
 * 到期、禁用和超出流量配额的用户会在重新渲染配置时自动从独立 listener 中排除。
-* 菜单 `77` -> `8` 会通过 iptables 按用户端口刷新流量统计，也可执行 `mh traffic`。
+* 菜单 `77` -> `8` 会通过 iptables 按用户端口刷新流量统计，也可执行 `mh traffic`；开启 IPv6 监听时会同步使用 `ip6tables` 统计 IPv6 流量。
 * 第一次刷新会建立 `/etc/mihomo/traffic.db` 快照；后续刷新会按用户端口的 TCP + UDP 入站和出站字节增量累加到 `used_bytes`。
-* 刷新流量统计只更新本地数据库，默认不会重启 Mihomo；只有用户达到流量配额、需要移除 listener 时才会重载服务。
+* 手动刷新流量统计只在用户达到流量配额、需要移除 listener 时才会重载服务。
 * 用户端口、启停状态、到期/配额或用户列表变化时，脚本会重建 iptables 统计规则并重置流量快照，已累计的 `used_bytes` 不会被清零。
-* 该方案不再依赖 Mihomo `/connections` 是否返回用户字段。LXC 容器需要具备 iptables / NET_ADMIN 权限，否则只能管理用户，无法读取端口流量计数。
+* 该方案不再依赖 Mihomo `/connections` 是否返回用户字段。LXC 容器需要具备 iptables / ip6tables / NET_ADMIN 权限，否则只能管理用户，无法读取端口流量计数。
 * 菜单 `77` -> `9` 可重置指定用户的已用流量，便于测试配额。
 * 菜单 `77` -> `10` 可输出指定用户的单节点链接和 Base64 订阅，也可执行 `mh sub-user`。
 * 菜单 `77` -> `11` 可修改指定用户的独立监听端口。
 * 菜单 `77` -> `12` 可启用或关闭每 10 分钟自动刷新流量统计，也可执行 `mh traffic-cron`；自动任务通过 root crontab 调用 `mh traffic-auto`，并使用轻量锁避免刷新重叠。
-* 如果低配 Alpine/LXC 需要优先跑满带宽，可在菜单 `44` 使用 Alpine/LXC 跑满带宽模式。该模式会关闭自动流量统计并清理 iptables 统计规则；之后手动执行 `mh traffic` 会重新建立统计规则。
+* 自动刷新只记录用量，不会在后台主动重启 Mihomo；需要立即执行超额用户限制时，手动运行 `mh traffic` 或在面板执行 `77` -> `7`。
+* 如果低配 Alpine/LXC 需要优先跑满带宽，可在菜单 `44` 使用 Alpine/LXC 稳速跑满带宽模式。该模式会关闭自动流量统计并清理 iptables 统计规则；之后手动执行 `mh traffic` 会重新建立统计规则。
