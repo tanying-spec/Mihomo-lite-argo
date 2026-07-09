@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.2"
+SCRIPT_VERSION="1.9.5"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -26,6 +26,7 @@ PUBLIC_IP_CACHE_FILE="$CONFIG_DIR/public.ip"
 SYSCTL_CONF_FILE="/etc/sysctl.d/99-mihomo-lite.conf"
 MIHOMO_GOMEMLIMIT="${MIHOMO_GOMEMLIMIT:-}"
 MIHOMO_GOGC="${MIHOMO_GOGC:-}"
+MIHOMO_GOMAXPROCS="${MIHOMO_GOMAXPROCS:-}"
 MIHOMO_IPV6="${MIHOMO_IPV6:-}"
 MIHOMO_PREFER_IPV6="${MIHOMO_PREFER_IPV6:-}"
 MIHOMO_MULTI_USER="${MIHOMO_MULTI_USER:-}"
@@ -205,11 +206,101 @@ make_temp() {
   }
 }
 
+host_cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc 2>/dev/null && return 0
+  fi
+  getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n'
+}
+
+cpu_quota_count() {
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max || true
+    if [ "${cpu_quota:-max}" != "max" ]; then
+      awk -v quota="$cpu_quota" -v period="$cpu_period" 'BEGIN {
+        if (quota > 0 && period > 0) {
+          value = int((quota + period - 1) / period);
+          if (value < 1) value = 1;
+          print value;
+        }
+      }'
+      return 0
+    fi
+  fi
+
+  cpu_quota_file=""
+  cpu_period_file=""
+  for cpu_base in /sys/fs/cgroup/cpu /sys/fs/cgroup; do
+    if [ -r "$cpu_base/cpu.cfs_quota_us" ] && [ -r "$cpu_base/cpu.cfs_period_us" ]; then
+      cpu_quota_file="$cpu_base/cpu.cfs_quota_us"
+      cpu_period_file="$cpu_base/cpu.cfs_period_us"
+      break
+    fi
+  done
+
+  if [ -n "$cpu_quota_file" ]; then
+    cpu_quota="$(cat "$cpu_quota_file" 2>/dev/null || printf '')"
+    cpu_period="$(cat "$cpu_period_file" 2>/dev/null || printf '')"
+    awk -v quota="$cpu_quota" -v period="$cpu_period" 'BEGIN {
+      if (quota > 0 && period > 0) {
+        value = int((quota + period - 1) / period);
+        if (value < 1) value = 1;
+        print value;
+      }
+    }'
+  fi
+}
+
+cpuset_cpu_count() {
+  for cpuset_file in \
+    /sys/fs/cgroup/cpuset.cpus.effective \
+    /sys/fs/cgroup/cpuset.cpus \
+    /sys/fs/cgroup/cpuset/cpuset.cpus; do
+    if [ -r "$cpuset_file" ]; then
+      cpuset_value="$(cat "$cpuset_file" 2>/dev/null | tr -d '[:space:]')"
+      [ -n "$cpuset_value" ] || continue
+      printf '%s\n' "$cpuset_value" | awk -F, '
+        {
+          total = 0
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[0-9]+-[0-9]+$/) {
+              split($i, range, "-")
+              if (range[2] >= range[1]) total += range[2] - range[1] + 1
+            } else if ($i ~ /^[0-9]+$/) {
+              total++
+            }
+          }
+          if (total > 0) print total
+        }'
+      return 0
+    fi
+  done
+}
+
+effective_cpu_count() {
+  quota_count="$(cpu_quota_count | sed -n '1p')"
+  cpuset_count="$(cpuset_cpu_count | sed -n '1p')"
+  host_count="$(host_cpu_count | sed -n '1p')"
+  case "$quota_count" in ''|*[!0-9]*) quota_count="" ;; esac
+  case "$cpuset_count" in ''|*[!0-9]*) cpuset_count="" ;; esac
+  case "$host_count" in ''|*[!0-9]*) host_count=1 ;; esac
+
+  cpu_count="$host_count"
+  if [ -n "$quota_count" ] && [ "$quota_count" -lt "$cpu_count" ]; then
+    cpu_count="$quota_count"
+  fi
+  if [ -n "$cpuset_count" ] && [ "$cpuset_count" -lt "$cpu_count" ]; then
+    cpu_count="$cpuset_count"
+  fi
+  printf '%s\n' "$cpu_count"
+}
+
 recommended_runtime() {
+  cpu_count="$(effective_cpu_count)"
   case "${os_id:-}" in
-    alpine) printf '192MiB|75' ;;
-    debian|ubuntu) printf '384MiB|150' ;;
-    *) printf '256MiB|100' ;;
+    alpine) printf '192MiB|75|%s' "$cpu_count" ;;
+    debian|ubuntu) printf '384MiB|150|%s' "$cpu_count" ;;
+    *) printf '256MiB|100|%s' "$cpu_count" ;;
   esac
 }
 
@@ -222,6 +313,9 @@ load_runtime_tuning() {
           ;;
         MIHOMO_GOGC)
           [ -n "$MIHOMO_GOGC" ] || MIHOMO_GOGC="$runtime_value"
+          ;;
+        MIHOMO_GOMAXPROCS)
+          [ -n "$MIHOMO_GOMAXPROCS" ] || MIHOMO_GOMAXPROCS="$runtime_value"
           ;;
       esac
     done < "$RUNTIME_ENV_FILE"
@@ -241,6 +335,16 @@ validate_runtime_tuning() {
       exit 1
       ;;
   esac
+  case "${MIHOMO_GOMAXPROCS:-}" in
+    ''|*[!0-9]*)
+      red "GOMAXPROCS 必须是正整数。"
+      exit 1
+      ;;
+  esac
+  if [ "$MIHOMO_GOMAXPROCS" -lt 1 ]; then
+    red "GOMAXPROCS 必须大于 0。"
+    exit 1
+  fi
 }
 
 write_runtime_tuning() {
@@ -248,6 +352,7 @@ write_runtime_tuning() {
   {
     printf 'MIHOMO_GOMEMLIMIT=%s\n' "$MIHOMO_GOMEMLIMIT"
     printf 'MIHOMO_GOGC=%s\n' "$MIHOMO_GOGC"
+    printf 'MIHOMO_GOMAXPROCS=%s\n' "$MIHOMO_GOMAXPROCS"
   } > "$RUNTIME_ENV_FILE"
   chmod 600 "$RUNTIME_ENV_FILE"
 }
@@ -255,10 +360,14 @@ write_runtime_tuning() {
 prompt_runtime_tuning() {
   env_mem="$MIHOMO_GOMEMLIMIT"
   env_gogc="$MIHOMO_GOGC"
+  env_gomaxprocs="$MIHOMO_GOMAXPROCS"
   load_runtime_tuning
   recommended="$(recommended_runtime)"
   recommended_mem="${recommended%%|*}"
-  recommended_gogc="${recommended#*|}"
+  recommended_rest="${recommended#*|}"
+  recommended_gogc="${recommended_rest%%|*}"
+  recommended_gomaxprocs="${recommended_rest#*|}"
+  [ "$recommended_gomaxprocs" = "$recommended_rest" ] && recommended_gomaxprocs="$(effective_cpu_count)"
 
   ui_section "设置 Mihomo 运行参数"
   if [ -z "$env_mem" ]; then
@@ -277,6 +386,15 @@ prompt_runtime_tuning() {
     MIHOMO_GOGC="${input_gogc:-$default_gogc}"
   else
     ui_warn "使用环境变量 GOGC=$MIHOMO_GOGC"
+  fi
+
+  if [ -z "$env_gomaxprocs" ]; then
+    default_gomaxprocs="${MIHOMO_GOMAXPROCS:-$recommended_gomaxprocs}"
+    ui_prompt "请输入 GOMAXPROCS（默认 $default_gomaxprocs，推荐 $recommended_gomaxprocs）："
+    read -r input_gomaxprocs || true
+    MIHOMO_GOMAXPROCS="${input_gomaxprocs:-$default_gomaxprocs}"
+  else
+    ui_warn "使用环境变量 GOMAXPROCS=$MIHOMO_GOMAXPROCS"
   fi
 
   validate_runtime_tuning
@@ -470,8 +588,20 @@ quota_to_bytes() {
   '
 }
 
+sanitize_db_field() {
+  printf '%s' "$1" | tr -d '|\r\n'
+}
+
 sanitize_user_field() {
-  printf '%s' "$1" | tr -d '|'
+  sanitize_db_field "$1"
+}
+
+sanitize_sni_field() {
+  printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'
+}
+
+yaml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 user_name_exists() {
@@ -598,12 +728,12 @@ new_uuid() {
 
 url_path() {
   value="${1:-node}"
-  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/\//%2F/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g'
+  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/\//%2F/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g; s/@/%40/g; s/:/%3A/g; s/"/%22/g; s/'\''/%27/g; s/+/%2B/g; s/=/%3D/g'
 }
 
 url_query() {
   value="${1:-}"
-  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g; s/\[/%5B/g; s/\]/%5D/g; s/:/%3A/g'
+  printf '%s' "$value" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g; s/\[/%5B/g; s/\]/%5D/g; s/:/%3A/g; s/"/%22/g; s/'\''/%27/g; s/+/%2B/g; s/=/%3D/g'
 }
 
 need_openssl() {
@@ -868,21 +998,24 @@ render_user_listener() {
   IFS='|' read -r render_proto render_node_name render_node_port render_value1 render_value2 render_value3 render_value4 render_value5 render_value6 <<EOF
 $render_node_record
 EOF
+  render_user_name_yaml="$(yaml_escape "$render_user_name")"
+  render_user_credential_yaml="$(yaml_escape "$render_user_credential")"
+  render_listen_address_yaml="$(yaml_escape "$render_listen_address")"
 
   case "$render_user_proto" in
     vless-reality)
-      render_sni="$render_value2"
-      render_dest="$render_value3"
-      render_private_key="$render_value4"
-      render_short_id="$render_value6"
+      render_sni="$(yaml_escape "$render_value2")"
+      render_dest="$(yaml_escape "$render_value3")"
+      render_private_key="$(yaml_escape "$render_value4")"
+      render_short_id="$(yaml_escape "$render_value6")"
       cat <<EOF
-  - name: "$render_user_name"
+  - name: "$render_user_name_yaml"
     type: vless
     port: $render_user_port
-    listen: "$render_listen_address"
+    listen: "$render_listen_address_yaml"
     users:
-      - username: "$render_user_name"
-        uuid: "$render_user_credential"
+      - username: "$render_user_name_yaml"
+        uuid: "$render_user_credential_yaml"
     tls: true
     reality-config:
       dest: "$render_dest"
@@ -894,17 +1027,17 @@ EOF
 EOF
       ;;
     hysteria2)
-      render_sni="$render_value2"
-      render_cert_file="$render_value3"
-      render_key_file="$render_value4"
-      render_salamander_password="$render_value5"
+      render_sni="$(yaml_escape "$render_value2")"
+      render_cert_file="$(yaml_escape "$render_value3")"
+      render_key_file="$(yaml_escape "$render_value4")"
+      render_salamander_password="$(yaml_escape "$render_value5")"
       cat <<EOF
-  - name: "$render_user_name"
+  - name: "$render_user_name_yaml"
     type: hysteria2
     port: $render_user_port
-    listen: "$render_listen_address"
+    listen: "$render_listen_address_yaml"
     users:
-      "$render_user_name": "$render_user_credential"
+      "$render_user_name_yaml": "$render_user_credential_yaml"
     certificate: "$render_cert_file"
     private-key: "$render_key_file"
     up: ${HY2_UP_MBPS} Mbps
@@ -918,30 +1051,30 @@ EOF
       fi
       ;;
     anytls)
-      render_cert_file="$render_value3"
-      render_key_file="$render_value4"
+      render_cert_file="$(yaml_escape "$render_value3")"
+      render_key_file="$(yaml_escape "$render_value4")"
       cat <<EOF
-  - name: "$render_user_name"
+  - name: "$render_user_name_yaml"
     type: anytls
     port: $render_user_port
-    listen: "$render_listen_address"
+    listen: "$render_listen_address_yaml"
     users:
-      "$render_user_name": "$render_user_credential"
+      "$render_user_name_yaml": "$render_user_credential_yaml"
     certificate: "$render_cert_file"
     private-key: "$render_key_file"
 EOF
       ;;
     vless-ws)
-      render_ws_path="$render_value2"
+      render_ws_path="$(yaml_escape "$render_value2")"
       cat <<EOF
-  - name: "$render_user_name"
+  - name: "$render_user_name_yaml"
     type: vless
     port: $render_user_port
-    listen: "$render_listen_address"
+    listen: "$render_listen_address_yaml"
     allow-insecure: true
     users:
-      - username: "$render_user_name"
-        uuid: "$render_user_credential"
+      - username: "$render_user_name_yaml"
+        uuid: "$render_user_credential_yaml"
     ws-path: "$render_ws_path"
 EOF
       ;;
@@ -1008,20 +1141,22 @@ EOF
     printf 'listeners:\n' >> "$tmp_file"
     while IFS='|' read -r cfg_proto cfg_node_name cfg_node_port cfg_value1 cfg_value2 cfg_value3 cfg_value4 cfg_value5 cfg_value6; do
       [ -n "$cfg_proto" ] || continue
+      cfg_node_name_yaml="$(yaml_escape "$cfg_node_name")"
+      cfg_listen_address_yaml="$(yaml_escape "$cfg_listen_address")"
       case "$cfg_proto" in
         vless-reality)
-          cfg_node_uuid="$cfg_value1"
-          cfg_sni="$cfg_value2"
-          cfg_dest="$cfg_value3"
-          cfg_private_key="$cfg_value4"
-          cfg_short_id="$cfg_value6"
+          cfg_node_uuid="$(yaml_escape "$cfg_value1")"
+          cfg_sni="$(yaml_escape "$cfg_value2")"
+          cfg_dest="$(yaml_escape "$cfg_value3")"
+          cfg_private_key="$(yaml_escape "$cfg_value4")"
+          cfg_short_id="$(yaml_escape "$cfg_value6")"
           cat >> "$tmp_file" <<EOF
-  - name: "$cfg_node_name"
+  - name: "$cfg_node_name_yaml"
     type: vless
     port: $cfg_node_port
-    listen: "$cfg_listen_address"
+    listen: "$cfg_listen_address_yaml"
     users:
-      - username: "$cfg_node_name"
+      - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
           cat >> "$tmp_file" <<EOF
@@ -1036,17 +1171,17 @@ EOF
 EOF
           ;;
         hysteria2)
-          cfg_node_password="$cfg_value1"
-          cfg_cert_file="$cfg_value3"
-          cfg_key_file="$cfg_value4"
-          cfg_salamander_password="$cfg_value5"
+          cfg_node_password="$(yaml_escape "$cfg_value1")"
+          cfg_cert_file="$(yaml_escape "$cfg_value3")"
+          cfg_key_file="$(yaml_escape "$cfg_value4")"
+          cfg_salamander_password="$(yaml_escape "$cfg_value5")"
           cat >> "$tmp_file" <<EOF
-  - name: "$cfg_node_name"
+  - name: "$cfg_node_name_yaml"
     type: hysteria2
     port: $cfg_node_port
-    listen: "$cfg_listen_address"
+    listen: "$cfg_listen_address_yaml"
     users:
-      "$cfg_node_name": "$cfg_node_password"
+      "$cfg_node_name_yaml": "$cfg_node_password"
 EOF
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
@@ -1062,16 +1197,16 @@ EOF
           fi
           ;;
         anytls)
-          cfg_node_password="$cfg_value1"
-          cfg_cert_file="$cfg_value3"
-          cfg_key_file="$cfg_value4"
+          cfg_node_password="$(yaml_escape "$cfg_value1")"
+          cfg_cert_file="$(yaml_escape "$cfg_value3")"
+          cfg_key_file="$(yaml_escape "$cfg_value4")"
           cat >> "$tmp_file" <<EOF
-  - name: "$cfg_node_name"
+  - name: "$cfg_node_name_yaml"
     type: anytls
     port: $cfg_node_port
-    listen: "$cfg_listen_address"
+    listen: "$cfg_listen_address_yaml"
     users:
-      "$cfg_node_name": "$cfg_node_password"
+      "$cfg_node_name_yaml": "$cfg_node_password"
 EOF
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
@@ -1079,16 +1214,16 @@ EOF
 EOF
           ;;
         vless-ws)
-          cfg_node_uuid="$cfg_value1"
-          cfg_ws_path="$cfg_value2"
+          cfg_node_uuid="$(yaml_escape "$cfg_value1")"
+          cfg_ws_path="$(yaml_escape "$cfg_value2")"
           cat >> "$tmp_file" <<EOF
-  - name: "$cfg_node_name"
+  - name: "$cfg_node_name_yaml"
     type: vless
     port: $cfg_node_port
-    listen: "$cfg_listen_address"
+    listen: "$cfg_listen_address_yaml"
     allow-insecure: true
     users:
-      - username: "$cfg_node_name"
+      - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
           cat >> "$tmp_file" <<EOF
@@ -1129,10 +1264,11 @@ Wants=network-online.target
 Type=simple
 Environment=GOMEMLIMIT=$MIHOMO_GOMEMLIMIT
 Environment=GOGC=$MIHOMO_GOGC
+Environment=GOMAXPROCS=$MIHOMO_GOMAXPROCS
 ExecStart=$BIN_PATH -d $CONFIG_DIR -f $CONFIG_FILE
 Restart=on-failure
 RestartSec=5s
-LimitNOFILE=65535
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -1154,8 +1290,10 @@ error_log="$LOG_DIR/${SERVICE_NAME}.err"
 supervisor="supervise-daemon"
 respawn_delay=5
 respawn_max=0
+rc_ulimit="-n 1048576"
 export GOMEMLIMIT="$MIHOMO_GOMEMLIMIT"
 export GOGC="$MIHOMO_GOGC"
+export GOMAXPROCS="$MIHOMO_GOMAXPROCS"
 
 depend() {
   need net
@@ -1494,7 +1632,7 @@ protocol_label() {
 }
 
 sanitize_label() {
-  printf '%s' "$1" | tr -d '|/'
+  sanitize_db_field "$1" | tr -d '/'
 }
 
 node_share_link() {
@@ -1514,16 +1652,16 @@ node_share_link() {
   case "$proto" in
     vless-reality)
       node_uuid="$value1"
-      sni="$value2"
-      public_key="$value5"
-      short_id="$value6"
+      sni="$(url_query "$value2")"
+      public_key="$(url_query "$value5")"
+      short_id="$(url_query "$value6")"
       printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
         "$node_uuid" "$server_host" "$node_port" "$sni" "$public_key" "$short_id" "$link_name"
       ;;
     hysteria2)
-      node_password="$value1"
-      sni="$value2"
-      salamander_password="$value5"
+      node_password="$(url_path "$value1")"
+      sni="$(url_query "$value2")"
+      salamander_password="$(url_query "$value5")"
       if [ -n "$salamander_password" ]; then
         printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s&upmbps=%s&downmbps=%s&obfs=salamander&obfs-password=%s#%s\n' \
           "$node_password" "$server_host" "$node_port" "$sni" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS" "$salamander_password" "$link_name"
@@ -1533,8 +1671,8 @@ node_share_link() {
       fi
       ;;
     anytls)
-      node_password="$value1"
-      sni="$value2"
+      node_password="$(url_path "$value1")"
+      sni="$(url_query "$value2")"
       printf 'anytls://%s@%s:%s?insecure=1&sni=%s#%s\n' \
         "$node_password" "$server_host" "$node_port" "$sni" "$link_name"
       ;;
@@ -1584,6 +1722,8 @@ add_vless_reality_node() {
   ui_prompt "请输入 Reality SNI（默认 www.amd.com）："
   read -r sni || true
   [ -n "$sni" ] || sni="www.amd.com"
+  sni="$(sanitize_sni_field "$sni")"
+  [ -n "$sni" ] || sni="www.amd.com"
   dest="${sni}:443"
   node_uuid="$(new_uuid)"
   key_pair="$(create_reality_keypair)" || exit 1
@@ -1603,6 +1743,8 @@ add_hysteria2_node() {
   node_port="$SELECTED_NODE_PORT"
   ui_prompt "请输入 TLS SNI / 证书域名（默认 www.amd.com）："
   read -r sni || true
+  [ -n "$sni" ] || sni="www.amd.com"
+  sni="$(sanitize_sni_field "$sni")"
   [ -n "$sni" ] || sni="www.amd.com"
   default_password="$(rand_alnum 32)"
   ui_prompt "请输入 Hysteria2 密码（默认随机生成）："
@@ -1635,6 +1777,8 @@ add_anytls_node() {
   ui_prompt "请输入 TLS SNI / 证书域名（默认 www.amd.com）："
   read -r sni || true
   [ -n "$sni" ] || sni="www.amd.com"
+  sni="$(sanitize_sni_field "$sni")"
+  [ -n "$sni" ] || sni="www.amd.com"
   node_password="$(rand_alnum 32)"
   cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
   cert_file="${cert_pair%%|*}"
@@ -1654,11 +1798,12 @@ add_vless_ws_node() {
   ui_prompt "请输入 WebSocket 域名/Host（你托管在Cloudflare的域名）："
   read -r ws_host || true
   [ -n "$ws_host" ] || ws_host="$server_ip"
-  ws_host="$(printf '%s' "$ws_host" | tr -d '|')"
+  ws_host="$(sanitize_db_field "$ws_host")"
   default_path="/$(rand_alnum 10)"
   ui_prompt "请输入 WebSocket 路径（默认 $default_path）："
   read -r ws_path || true
   [ -n "$ws_path" ] || ws_path="$default_path"
+  ws_path="$(sanitize_db_field "$ws_path")"
   case "$ws_path" in
     /*) ;;
     *) ws_path="/$ws_path" ;;
@@ -1754,6 +1899,7 @@ rename_all_nodes() {
   fi
 
   tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
+  rename_map_file="$(make_temp "$CONFIG_DIR/rename-map.XXXXXX")"
   reality_count=0
   hy2_count=0
   anytls_count=0
@@ -1774,8 +1920,10 @@ rename_all_nodes() {
         if [ "$proto_count" -gt 1 ]; then
           new_name="${new_name}-${proto_count}"
         fi
+        new_name="$(sanitize_db_field "$new_name")"
         printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
           "$proto" "$new_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6" >> "$tmp_file"
+        printf '%s|%s|%s\n' "$proto" "$node_name" "$new_name" >> "$rename_map_file"
         ;;
       *)
         printf '%s\n' "$db_line" >> "$tmp_file"
@@ -1785,6 +1933,25 @@ rename_all_nodes() {
 
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
+  if [ -s "$USERS_DB" ]; then
+    users_tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+    awk -F'|' '
+      BEGIN { OFS = FS }
+      NR == FNR {
+        key = $1 "|" $2
+        renamed[key] = $3
+        next
+      }
+      NF >= 9 {
+        key = $3 "|" $2
+        if (key in renamed) $2 = renamed[key]
+      }
+      { print }
+    ' "$rename_map_file" "$USERS_DB" > "$users_tmp_file"
+    mv "$users_tmp_file" "$USERS_DB"
+    chmod 600 "$USERS_DB"
+  fi
+  rm -f "$rename_map_file"
   render_config
   restart_service
   ui_success "所有节点已按 ${country_emoji}${country_name}-${provider}-协议 格式重命名。"
@@ -2014,6 +2181,7 @@ add_multi_user() {
   IFS='|' read -r user_proto user_node_name user_node_port user_value1 user_value2 user_value3 user_value4 user_value5 user_value6 <<EOF
 $node_record
 EOF
+  user_node_name="$(sanitize_db_field "$user_node_name")"
 
   ui_prompt "请输入用户名（英文/数字/下划线，不能重复）："
   read -r user_name || true
@@ -2060,8 +2228,30 @@ EOF
       ;;
   esac
 
+  default_user_port="$(unique_port)"
+  ui_prompt "请输入用户监听端口（默认 $default_user_port，回车自动分配）："
+  read -r user_port_input || true
+  if [ -z "$user_port_input" ]; then
+    user_port="$default_user_port"
+  else
+    case "$user_port_input" in
+      ''|*[!0-9]*)
+        ui_error "端口必须是数字。"
+        return 1
+        ;;
+    esac
+    if [ "$user_port_input" -lt 1 ] || [ "$user_port_input" -gt 65535 ]; then
+      ui_error "端口范围必须为 1-65535。"
+      return 1
+    fi
+    if port_in_use "$user_port_input"; then
+      ui_error "端口 $user_port_input 已被其他节点或用户占用。"
+      return 1
+    fi
+    user_port="$user_port_input"
+  fi
+
   user_created="$(today_ymd)"
-  user_port="$(unique_port)"
   printf '%s|%s|%s|%s|%s|%s|0|1|%s||%s\n' \
     "$user_name" "$user_node_name" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "$user_created" "$user_port" >> "$USERS_DB"
   chmod 600 "$USERS_DB"
@@ -2773,58 +2963,92 @@ performance_tuning_menu() {
   load_runtime_tuning
   recommended="$(recommended_runtime)"
   recommended_mem="${recommended%%|*}"
-  recommended_gogc="${recommended#*|}"
+  recommended_rest="${recommended#*|}"
+  recommended_gogc="${recommended_rest%%|*}"
+  recommended_gomaxprocs="${recommended_rest#*|}"
+  [ "$recommended_gomaxprocs" = "$recommended_rest" ] && recommended_gomaxprocs="$(effective_cpu_count)"
   current_mem="${MIHOMO_GOMEMLIMIT:-未设置}"
   current_gogc="${MIHOMO_GOGC:-未设置}"
+  current_gomaxprocs="${MIHOMO_GOMAXPROCS:-未设置}"
+  bandwidth_mode=0
 
   case "${os_id:-}" in
     alpine)
       high_mem="256MiB"
       high_gogc="125"
+      bandwidth_mem="256MiB"
+      bandwidth_gogc="150"
       ;;
     *)
       high_mem="512MiB"
       high_gogc="200"
+      bandwidth_mem="768MiB"
+      bandwidth_gogc="250"
       ;;
   esac
 
   screen_title "性能优化菜单"
   cat <<EOF
- 当前参数：GOMEMLIMIT=$current_mem  GOGC=$current_gogc
- 系统推荐：GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc
+ 当前参数：GOMEMLIMIT=$current_mem  GOGC=$current_gogc  GOMAXPROCS=$current_gomaxprocs
+ 系统推荐：GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_GREEN}1.${C_RESET} 低配稳定模式    GOMEMLIMIT=192MiB  GOGC=75
- ${C_GREEN}2.${C_RESET} 系统推荐模式    GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc
- ${C_GREEN}3.${C_RESET} 高吞吐模式      GOMEMLIMIT=$high_mem  GOGC=$high_gogc
- ${C_GREEN}4.${C_RESET} 自定义参数
+ ${C_GREEN}1.${C_RESET} 低配稳定模式        GOMEMLIMIT=192MiB  GOGC=75   GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}2.${C_RESET} 系统推荐模式        GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}3.${C_RESET} 高吞吐模式          GOMEMLIMIT=$high_mem  GOGC=$high_gogc  GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}4.${C_RESET} Alpine/LXC 跑满带宽  GOMEMLIMIT=$bandwidth_mem  GOGC=$bandwidth_gogc  GOMAXPROCS=$recommended_gomaxprocs
+ ${C_GREEN}5.${C_RESET} 自定义参数
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-  ui_prompt "请输入数字选择 (0-4)："
+  ui_prompt "请输入数字选择 (0-5)："
   read -r perf_choice || true
 
   case "$perf_choice" in
     1)
       MIHOMO_GOMEMLIMIT="192MiB"
       MIHOMO_GOGC="75"
+      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
       ;;
     2)
       MIHOMO_GOMEMLIMIT="$recommended_mem"
       MIHOMO_GOGC="$recommended_gogc"
+      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
       ;;
     3)
       MIHOMO_GOMEMLIMIT="$high_mem"
       MIHOMO_GOGC="$high_gogc"
+      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
       ;;
     4)
+      ui_warn "跑满带宽模式会关闭自动流量统计，并移除 iptables 统计规则以降低包路径开销。"
+      ui_warn "流量配额不会实时累计；再次执行 mh traffic 会重建统计规则。"
+      ui_prompt "确认应用跑满带宽模式？输入 y 确认："
+      read -r bandwidth_confirm || true
+      case "$bandwidth_confirm" in
+        y|Y|yes|YES) ;;
+        *)
+          ui_warn "已取消跑满带宽模式。"
+          return 0
+          ;;
+      esac
+      MIHOMO_GOMEMLIMIT="$bandwidth_mem"
+      MIHOMO_GOGC="$bandwidth_gogc"
+      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
+      bandwidth_mode=1
+      ;;
+    5)
       default_mem="${MIHOMO_GOMEMLIMIT:-$recommended_mem}"
       default_gogc="${MIHOMO_GOGC:-$recommended_gogc}"
+      default_gomaxprocs="${MIHOMO_GOMAXPROCS:-$recommended_gomaxprocs}"
       ui_prompt "请输入 GOMEMLIMIT（默认 $default_mem）："
       read -r input_mem || true
       MIHOMO_GOMEMLIMIT="${input_mem:-$default_mem}"
       ui_prompt "请输入 GOGC（默认 $default_gogc）："
       read -r input_gogc || true
       MIHOMO_GOGC="${input_gogc:-$default_gogc}"
+      ui_prompt "请输入 GOMAXPROCS（默认 $default_gomaxprocs）："
+      read -r input_gomaxprocs || true
+      MIHOMO_GOMAXPROCS="${input_gomaxprocs:-$default_gomaxprocs}"
       ;;
     0)
       ui_warn "已取消性能参数调整。"
@@ -2839,7 +3063,12 @@ EOF
   validate_runtime_tuning
   write_runtime_tuning
   apply_runtime_service
-  ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC。"
+  if [ "$bandwidth_mode" = "1" ]; then
+    disable_traffic_auto_refresh >/dev/null 2>&1 || true
+    cleanup_user_traffic_rules >/dev/null 2>&1 || true
+    ui_success "已关闭自动流量统计并清理 iptables 统计规则。"
+  fi
+  ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS。"
 }
 
 apply_sysctl_value() {
@@ -2900,11 +3129,19 @@ optimize_sysctl_network() {
   if apply_sysctl_value "net.core.wmem_max" "67108864" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.core.rmem_default" "262144" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.core.wmem_default" "262144" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.core.optmem_max" "65536" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.core.somaxconn" "65535" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.core.netdev_max_backlog" "250000" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.ipv4.tcp_max_syn_backlog" "65535" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_rmem" "4096 87380 67108864" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_wmem" "4096 65536 67108864" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_window_scaling" "1" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.ipv4.tcp_fastopen" "3" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.ipv4.tcp_mtu_probing" "1" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_slow_start_after_idle" "0" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_tw_reuse" "1" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_fin_timeout" "15" "$tmp_file"; then applied=$((applied + 1)); fi
+  if apply_sysctl_value "net.ipv4.tcp_keepalive_time" "600" "$tmp_file"; then applied=$((applied + 1)); fi
   if apply_sysctl_value "net.ipv4.ip_local_port_range" "1024 65535" "$tmp_file"; then applied=$((applied + 1)); fi
 
   if [ "$applied" -eq 0 ]; then
