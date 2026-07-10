@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.9.9"
+SCRIPT_VERSION="1.10.1"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -18,6 +18,7 @@ TRAFFIC_CHAIN_IN="${TRAFFIC_CHAIN}_IN"
 TRAFFIC_CHAIN_OUT="${TRAFFIC_CHAIN}_OUT"
 TRAFFIC_CRON_MARK="mihomo-lite-traffic-auto"
 TRAFFIC_LOCK_DIR="$CONFIG_DIR/traffic.lock"
+PUBLIC_IP_CACHE_TTL="${MIHOMO_PUBLIC_IP_CACHE_TTL:-21600}"
 LOG_DIR="/var/log/mihomo"
 SERVICE_NAME="mihomo"
 RUNTIME_ENV_FILE="$CONFIG_DIR/runtime.env"
@@ -255,6 +256,50 @@ cpu_quota_count() {
   fi
 }
 
+cpu_quota_milli() {
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max || true
+    if [ "${cpu_quota:-max}" != "max" ]; then
+      awk -v quota="$cpu_quota" -v period="$cpu_period" 'BEGIN {
+        if (quota > 0 && period > 0) {
+          value = int((quota * 1000 + period - 1) / period);
+          if (value < 1) value = 1;
+          print value;
+        }
+      }'
+      return 0
+    fi
+  fi
+
+  cpu_quota_file=""
+  cpu_period_file=""
+  for cpu_base in /sys/fs/cgroup/cpu /sys/fs/cgroup; do
+    if [ -r "$cpu_base/cpu.cfs_quota_us" ] && [ -r "$cpu_base/cpu.cfs_period_us" ]; then
+      cpu_quota_file="$cpu_base/cpu.cfs_quota_us"
+      cpu_period_file="$cpu_base/cpu.cfs_period_us"
+      break
+    fi
+  done
+
+  if [ -n "$cpu_quota_file" ]; then
+    cpu_quota="$(cat "$cpu_quota_file" 2>/dev/null || printf '')"
+    cpu_period="$(cat "$cpu_period_file" 2>/dev/null || printf '')"
+    awk -v quota="$cpu_quota" -v period="$cpu_period" 'BEGIN {
+      if (quota > 0 && period > 0) {
+        value = int((quota * 1000 + period - 1) / period);
+        if (value < 1) value = 1;
+        print value;
+      }
+    }'
+  fi
+}
+
+cpu_quota_severely_limited() {
+  cpu_milli="$(cpu_quota_milli | sed -n '1p')"
+  case "$cpu_milli" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cpu_milli" -lt 1000 ]
+}
+
 cpuset_cpu_count() {
   for cpuset_file in \
     /sys/fs/cgroup/cpuset.cpus.effective \
@@ -399,6 +444,10 @@ memlimit_from_percent() {
 
 recommended_runtime() {
   cpu_count="$(effective_cpu_count)"
+  cpu_limited=0
+  if cpu_quota_severely_limited; then
+    cpu_limited=1
+  fi
   memory_mib="$(memory_limit_mib)"
   case "$memory_mib" in
     ''|*[!0-9]*)
@@ -435,16 +484,37 @@ recommended_runtime() {
             ;;
         esac
       fi
+      if [ "$cpu_limited" = "1" ]; then
+        case "$recommended_gogc" in ''|*[!0-9]*) recommended_gogc="175" ;; esac
+        if [ "$recommended_gogc" -lt 175 ]; then
+          recommended_gogc="175"
+        fi
+        cpu_count="$(cap_cpu_count "$cpu_count" 1)"
+      fi
       printf '%s|%s|%s' "$recommended_mem" "$recommended_gogc" "$cpu_count"
       return 0
       ;;
   esac
 
   case "${os_id:-}" in
-    alpine) printf '192MiB|125|%s' "$cpu_count" ;;
-    debian|ubuntu) printf '384MiB|200|%s' "$cpu_count" ;;
-    *) printf '256MiB|150|%s' "$cpu_count" ;;
+    alpine)
+      fallback_mem="192MiB"
+      fallback_gogc="125"
+      ;;
+    debian|ubuntu)
+      fallback_mem="384MiB"
+      fallback_gogc="200"
+      ;;
+    *)
+      fallback_mem="256MiB"
+      fallback_gogc="150"
+      ;;
   esac
+  if [ "$cpu_limited" = "1" ]; then
+    [ "$fallback_gogc" -lt 175 ] && fallback_gogc="175"
+    cpu_count="$(cap_cpu_count "$cpu_count" 1)"
+  fi
+  printf '%s|%s|%s' "$fallback_mem" "$fallback_gogc" "$cpu_count"
 }
 
 load_runtime_tuning() {
@@ -756,9 +826,9 @@ quota_to_bytes() {
   esac
   printf '%s\n' "$quota_value" | awk '
     /^[0-9]+$/ { print $1; exit 0 }
-    /^[0-9]+[Gg]$/ { sub(/[Gg]$/, ""); print $1 * 1024 * 1024 * 1024; exit 0 }
-    /^[0-9]+[Mm]$/ { sub(/[Mm]$/, ""); print $1 * 1024 * 1024; exit 0 }
-    /^[0-9]+[Kk]$/ { sub(/[Kk]$/, ""); print $1 * 1024; exit 0 }
+    /^[0-9]+[Gg]$/ { sub(/[Gg]$/, ""); printf "%.0f\n", $1 * 1024 * 1024 * 1024; exit 0 }
+    /^[0-9]+[Mm]$/ { sub(/[Mm]$/, ""); printf "%.0f\n", $1 * 1024 * 1024; exit 0 }
+    /^[0-9]+[Kk]$/ { sub(/[Kk]$/, ""); printf "%.0f\n", $1 * 1024; exit 0 }
     { exit 1 }
   '
 }
@@ -827,8 +897,8 @@ ensure_user_ports() {
         changed=1
         ;;
     esac
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-      "$user_name" "$user_node" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "${user_used:-0}" "${user_enabled:-1}" "$user_created" "$user_note" "$user_port"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$user_name" "$user_node" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "${user_used:-0}" "${user_enabled:-1}" "$user_created" "$user_note" "$user_port" "${user_extra:-}"
   done < "$USERS_DB" > "$tmp_file"
 
   if [ "$changed" = "1" ]; then
@@ -1050,9 +1120,22 @@ fetch_public_ipv6() {
 cached_public_ip() {
   cache_family="$1"
   cache_ip=""
+  cache_time=""
+  cache_now="$(date +%s 2>/dev/null || printf '0')"
   if [ -r "$PUBLIC_IP_CACHE_FILE" ]; then
     cache_ip="$(awk -F= -v family="$cache_family" '$1 == family { value = $2 } END { print value }' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    cache_time="$(awk -F= -v family="${cache_family}_time" '$1 == family { value = $2 } END { print value }' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
     if [ -n "$cache_ip" ]; then
+      case "$cache_time" in
+        '') ;;
+        *[!0-9]*) return 1 ;;
+        *)
+          case "$PUBLIC_IP_CACHE_TTL" in ''|*[!0-9]*) return 1 ;; esac
+          if [ "$cache_now" -lt "$cache_time" ] || [ $((cache_now - cache_time)) -gt "$PUBLIC_IP_CACHE_TTL" ]; then
+            return 1
+          fi
+          ;;
+      esac
       case "$cache_family" in
         ipv6) is_ipv6 "$cache_ip" || return 1 ;;
         *) is_ipv4 "$cache_ip" || return 1 ;;
@@ -1061,7 +1144,7 @@ cached_public_ip() {
       return 0
     fi
 
-    cache_ip="$(sed -n '1p' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    cache_ip="$(sed -n '1p' "$PUBLIC_IP_CACHE_FILE" 2>/dev/null | sed 's/^ipv[46]=//' | tr -d '[:space:]')"
     case "$cache_family" in
       ipv6) is_ipv6 "$cache_ip" || return 1 ;;
       *) is_ipv4 "$cache_ip" || return 1 ;;
@@ -1081,12 +1164,14 @@ cache_public_ip() {
   fi
 
   tmp_file="$(make_temp "$CONFIG_DIR/public-ip.XXXXXX")"
+  cache_time="$(date +%s 2>/dev/null || printf '0')"
   if [ -r "$PUBLIC_IP_CACHE_FILE" ]; then
-    awk -F= -v family="$cache_family" '$1 != family && $1 ~ /^ipv[46]$/ { print }' "$PUBLIC_IP_CACHE_FILE" > "$tmp_file" 2>/dev/null || : > "$tmp_file"
+    awk -F= -v family="$cache_family" '$1 != family && $1 != family "_time" && $1 ~ /^ipv[46](_time)?$/ { print }' "$PUBLIC_IP_CACHE_FILE" > "$tmp_file" 2>/dev/null || : > "$tmp_file"
   else
     : > "$tmp_file"
   fi
   printf '%s=%s\n' "$cache_family" "$cache_ip" >> "$tmp_file"
+  printf '%s_time=%s\n' "$cache_family" "$cache_time" >> "$tmp_file"
   mv "$tmp_file" "$PUBLIC_IP_CACHE_FILE"
   chmod 600 "$PUBLIC_IP_CACHE_FILE"
 }
@@ -1581,6 +1666,16 @@ port_in_use() {
     NF >= 11 && $11 == p { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$USERS_DB" 2>/dev/null
+}
+
+remove_users_for_node() {
+  removed_node="$1"
+  [ -s "$USERS_DB" ] || return 0
+  tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+  awk -F'|' -v node="$removed_node" 'BEGIN { OFS = FS } NF >= 9 && $2 == node { next } { print }' "$USERS_DB" > "$tmp_file"
+  mv "$tmp_file" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+  reset_user_traffic_snapshot 2>/dev/null || true
 }
 
 ensure_iptables() {
@@ -2371,8 +2466,14 @@ delete_node() {
     esac
     : > "$NODES_DB"
     chmod 600 "$NODES_DB"
+    if multi_user_enabled && [ -f "$USERS_DB" ]; then
+      : > "$USERS_DB"
+      chmod 600 "$USERS_DB"
+      reset_user_traffic_snapshot
+    fi
     render_config
     restart_service
+    refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
     ui_success "所有节点已删除，服务已重启。"
     return 0
   fi
@@ -2408,8 +2509,12 @@ delete_node() {
   ' "$NODES_DB" > "$tmp_file"
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
+  if multi_user_enabled; then
+    remove_users_for_node "$deleted"
+  fi
   render_config
   restart_service
+  refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "节点 $deleted 已删除，服务已重启。"
 }
 
@@ -2704,7 +2809,32 @@ refresh_multi_user_status() {
   ui_success "已重新渲染配置。过期、禁用或超额用户不会写入独立 listener。"
 }
 
-update_user_traffic_from_iptables() {
+acquire_traffic_lock() {
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || return 1
+  if mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$TRAFFIC_LOCK_DIR/pid"
+    return 0
+  fi
+
+  if [ -f "$TRAFFIC_LOCK_DIR/pid" ]; then
+    lock_pid="$(cat "$TRAFFIC_LOCK_DIR/pid" 2>/dev/null || printf '')"
+    case "$lock_pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$lock_pid" 2>/dev/null && return 1 ;;
+    esac
+  fi
+  rm -f "$TRAFFIC_LOCK_DIR/pid"
+  rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || return 1
+  mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$TRAFFIC_LOCK_DIR/pid"
+}
+
+release_traffic_lock() {
+  rm -f "$TRAFFIC_LOCK_DIR/pid"
+  rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || true
+}
+
+_update_user_traffic_from_iptables() {
   traffic_quiet="${1:-0}"
   traffic_enforce="${2:-1}"
   ensure_multi_user_enabled
@@ -2789,14 +2919,6 @@ update_user_traffic_from_iptables() {
     mv "$tmp_current" "$TRAFFIC_DB"
     chmod 600 "$TRAFFIC_DB"
     rm -f "$tmp_deltas" "$tmp_users"
-    quota_crossed_count="$(quota_exceeded_user_count)"
-    if [ "$traffic_enforce" = "1" ] && [ "${quota_crossed_count:-0}" != "0" ]; then
-      render_config
-      restart_service
-      refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
-      [ "$traffic_quiet" = "1" ] || ui_success "检测到 $quota_crossed_count 个用户已达到流量配额，已重载服务并移除对应 listener。"
-      return 0
-    fi
     [ "$traffic_quiet" = "1" ] || ui_warn "已保存当前连接快照。本次没有新的可累计流量，请稍后再次刷新。"
     return 0
   fi
@@ -2818,8 +2940,9 @@ update_user_traffic_from_iptables() {
         if (enabled == "1" && quota > 0 && new_used >= quota) crossed++
         $7 = new_used
         changed++
-      }
-    }
+  }
+}
+
     { print }
     END {
       printf "%d|%d", changed, crossed > "/dev/stderr"
@@ -2863,6 +2986,17 @@ EOF
   fi
 }
 
+update_user_traffic_from_iptables() {
+  acquire_traffic_lock || {
+    [ "${1:-0}" = "1" ] || ui_warn "已有流量统计任务正在运行，本次刷新已跳过。"
+    return 0
+  }
+  _update_user_traffic_from_iptables "$@"
+  traffic_result=$?
+  release_traffic_lock
+  return "$traffic_result"
+}
+
 update_user_traffic_from_connections() {
   update_user_traffic_from_iptables "${1:-0}" "${2:-1}"
 }
@@ -2880,23 +3014,7 @@ run_traffic_auto_refresh() {
   need_root
   ensure_installed
   ensure_multi_user_enabled
-  if ! mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null; then
-    if [ -f "$TRAFFIC_LOCK_DIR/pid" ]; then
-      lock_pid="$(cat "$TRAFFIC_LOCK_DIR/pid" 2>/dev/null || printf '')"
-      case "$lock_pid" in
-        ''|*[!0-9]*) ;;
-        *)
-          kill -0 "$lock_pid" 2>/dev/null && exit 0
-          ;;
-      esac
-    fi
-    rm -f "$TRAFFIC_LOCK_DIR/pid"
-    rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || exit 0
-    mkdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || exit 0
-  fi
-  printf '%s\n' "$$" > "$TRAFFIC_LOCK_DIR/pid"
-  trap 'rm -f "$TRAFFIC_LOCK_DIR/pid"; rmdir "$TRAFFIC_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
-  update_user_traffic_from_connections 1 0
+  update_user_traffic_from_connections 1 1
 }
 
 enable_traffic_auto_refresh() {
@@ -3289,101 +3407,106 @@ performance_tuning_menu() {
     ''|*[!0-9]*) detected_memory_text="未检测到" ;;
     *) detected_memory_text="${detected_memory_mib}MiB" ;;
   esac
-  bandwidth_mode=0
-  cpu_mode=0
+  cleanup_stats_mode=0
+  cpu_limit_text="未检测到严重限制"
+  cpu_milli="$(cpu_quota_milli | sed -n '1p')"
+  case "$cpu_milli" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      cpu_core_text="$(awk -v milli="$cpu_milli" 'BEGIN { printf "%.2f", milli / 1000 }')"
+      if [ "$cpu_milli" -lt 1000 ]; then
+        cpu_limit_text="约 ${cpu_core_text} 核，已按 CPU 受限容器优化"
+      else
+        cpu_limit_text="约 ${cpu_core_text} 核"
+      fi
+      ;;
+  esac
 
-  stable_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
-  bandwidth_gomaxprocs="$recommended_gomaxprocs"
-  cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+  resource_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+  throughput_gomaxprocs="$recommended_gomaxprocs"
   case "$detected_memory_mib" in
     ''|*[!0-9]*)
       case "${os_id:-}" in
         alpine)
-          stable_mem="128MiB"
-          stable_gogc="75"
-          high_mem="256MiB"
-          high_gogc="150"
-          bandwidth_mem="192MiB"
-          bandwidth_gogc="150"
-          bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
-          cpu_mem="192MiB"
-          cpu_gogc="150"
-          cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+          resource_mem="192MiB"
+          resource_gogc="175"
+          throughput_mem="256MiB"
+          throughput_gogc="175"
+          throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
           ;;
         *)
-          stable_mem="192MiB"
-          stable_gogc="100"
-          high_mem="512MiB"
-          high_gogc="200"
-          bandwidth_mem="384MiB"
-          bandwidth_gogc="175"
-          bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
-          cpu_mem="384MiB"
-          cpu_gogc="175"
+          resource_mem="384MiB"
+          resource_gogc="200"
+          throughput_mem="512MiB"
+          throughput_gogc="200"
+          throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
           ;;
       esac
       ;;
     *)
-      stable_mem="$(memlimit_from_percent "$detected_memory_mib" 50 64 64 384)"
-      high_mem="$(memlimit_from_percent "$detected_memory_mib" 70 128 64 1024)"
-      bandwidth_mem="$(memlimit_from_percent "$detected_memory_mib" 60 96 96 768)"
-      cpu_mem="$(memlimit_from_percent "$detected_memory_mib" 60 96 96 768)"
+      resource_mem="$(memlimit_from_percent "$detected_memory_mib" 60 64 64 512)"
+      throughput_mem="$(memlimit_from_percent "$detected_memory_mib" 70 128 64 1024)"
       if [ "$detected_memory_mib" -le 256 ]; then
-        bandwidth_mem="$(memlimit_from_percent "$detected_memory_mib" 60 64 64 512)"
-        cpu_mem="$bandwidth_mem"
-        stable_gogc="75"
-        high_gogc="125"
-        bandwidth_gogc="125"
-        cpu_gogc="125"
-        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
-        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+        resource_gogc="175"
+        throughput_gogc="150"
+        throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
       elif [ "$detected_memory_mib" -le 512 ]; then
-        stable_gogc="100"
-        high_gogc="150"
-        bandwidth_gogc="150"
-        cpu_gogc="150"
-        bandwidth_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
-        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+        resource_gogc="200"
+        throughput_gogc="175"
+        throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
       elif [ "$detected_memory_mib" -le 1024 ]; then
-        stable_gogc="125"
-        high_gogc="175"
-        bandwidth_gogc="175"
-        cpu_gogc="175"
-        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+        resource_gogc="225"
+        throughput_gogc="200"
+        throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
       else
-        stable_gogc="125"
-        high_gogc="200"
-        bandwidth_gogc="200"
-        cpu_gogc="200"
-        cpu_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
+        resource_gogc="250"
+        throughput_gogc="250"
+        throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 4)"
       fi
       ;;
   esac
+  if cpu_quota_severely_limited; then
+    resource_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+    throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
+    [ "$resource_gogc" -lt 200 ] && resource_gogc="200"
+    [ "$throughput_gogc" -lt 175 ] && throughput_gogc="175"
+  fi
 
   screen_title "性能优化菜单"
   cat <<EOF
  当前参数：GOMEMLIMIT=$current_mem  GOGC=$current_gogc  GOMAXPROCS=$current_gomaxprocs
  当前 GODEBUG：$current_godebug
  检测内存：$detected_memory_text
+ CPU 配额：$cpu_limit_text
  系统推荐：GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_GREEN}1.${C_RESET} 低内存稳连模式      GOMEMLIMIT=$stable_mem  GOGC=$stable_gogc   GOMAXPROCS=$stable_gomaxprocs
+ ${C_GREEN}1.${C_RESET} 省资源稳连模式      GOMEMLIMIT=$resource_mem  GOGC=$resource_gogc  GOMAXPROCS=$resource_gomaxprocs
  ${C_GREEN}2.${C_RESET} 系统推荐模式        GOMEMLIMIT=$recommended_mem  GOGC=$recommended_gogc  GOMAXPROCS=$recommended_gomaxprocs
- ${C_GREEN}3.${C_RESET} 高吞吐模式          GOMEMLIMIT=$high_mem  GOGC=$high_gogc  GOMAXPROCS=$recommended_gomaxprocs
- ${C_GREEN}4.${C_RESET} Alpine/LXC 稳速跑满带宽  GOMEMLIMIT=$bandwidth_mem  GOGC=$bandwidth_gogc  GOMAXPROCS=$bandwidth_gomaxprocs
- ${C_GREEN}5.${C_RESET} 低 CPU 模式         GOMEMLIMIT=$cpu_mem  GOGC=$cpu_gogc  GOMAXPROCS=$cpu_gomaxprocs
- ${C_GREEN}6.${C_RESET} 自定义参数
+ ${C_GREEN}3.${C_RESET} 高吞吐/跑满带宽     GOMEMLIMIT=$throughput_mem  GOGC=$throughput_gogc  GOMAXPROCS=$throughput_gomaxprocs
+ ${C_GREEN}4.${C_RESET} 自定义参数
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
-  ui_prompt "请输入数字选择 (0-6)："
+  ui_prompt "请输入数字选择 (0-4)："
   read -r perf_choice || true
 
   case "$perf_choice" in
     1)
-      MIHOMO_GOMEMLIMIT="$stable_mem"
-      MIHOMO_GOGC="$stable_gogc"
-      MIHOMO_GOMAXPROCS="$stable_gomaxprocs"
+      ui_warn "省资源稳连模式会限制 Go 调度线程、提高 GOGC，并关闭自动流量统计以降低 CPU。"
+      ui_prompt "确认应用省资源稳连模式？输入 y 确认："
+      read -r resource_confirm || true
+      case "$resource_confirm" in
+        y|Y|yes|YES) ;;
+        *)
+          ui_warn "已取消省资源稳连模式。"
+          return 0
+          ;;
+      esac
+      MIHOMO_GOMEMLIMIT="$resource_mem"
+      MIHOMO_GOGC="$resource_gogc"
+      MIHOMO_GOMAXPROCS="$resource_gomaxprocs"
+      cleanup_stats_mode=1
       ;;
     2)
       MIHOMO_GOMEMLIMIT="$recommended_mem"
@@ -3391,45 +3514,23 @@ EOF
       MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
       ;;
     3)
-      MIHOMO_GOMEMLIMIT="$high_mem"
-      MIHOMO_GOGC="$high_gogc"
-      MIHOMO_GOMAXPROCS="$recommended_gomaxprocs"
+      ui_warn "高吞吐/跑满带宽模式会关闭自动流量统计，并移除 iptables 统计规则以降低包路径开销。"
+      ui_warn "流量配额不会实时累计；再次执行 mh traffic 会重建统计规则。"
+      ui_prompt "确认应用高吞吐/跑满带宽模式？输入 y 确认："
+      read -r throughput_confirm || true
+      case "$throughput_confirm" in
+        y|Y|yes|YES) ;;
+        *)
+          ui_warn "已取消高吞吐/跑满带宽模式。"
+          return 0
+          ;;
+      esac
+      MIHOMO_GOMEMLIMIT="$throughput_mem"
+      MIHOMO_GOGC="$throughput_gogc"
+      MIHOMO_GOMAXPROCS="$throughput_gomaxprocs"
+      cleanup_stats_mode=1
       ;;
     4)
-      ui_warn "跑满带宽模式会关闭自动流量统计，并移除 iptables 统计规则以降低包路径开销。"
-      ui_warn "流量配额不会实时累计；再次执行 mh traffic 会重建统计规则。"
-      ui_prompt "确认应用跑满带宽模式？输入 y 确认："
-      read -r bandwidth_confirm || true
-      case "$bandwidth_confirm" in
-        y|Y|yes|YES) ;;
-        *)
-          ui_warn "已取消跑满带宽模式。"
-          return 0
-          ;;
-      esac
-      MIHOMO_GOMEMLIMIT="$bandwidth_mem"
-      MIHOMO_GOGC="$bandwidth_gogc"
-      MIHOMO_GOMAXPROCS="$bandwidth_gomaxprocs"
-      bandwidth_mode=1
-      ;;
-    5)
-      ui_warn "低 CPU 模式会提高 GOGC、限制 Go 调度线程，并重建轻量流量统计规则。"
-      ui_warn "如果需要极限压测带宽，优先使用 4 号模式关闭统计链。"
-      ui_prompt "确认应用低 CPU 模式？输入 y 确认："
-      read -r cpu_confirm || true
-      case "$cpu_confirm" in
-        y|Y|yes|YES) ;;
-        *)
-          ui_warn "已取消低 CPU 模式。"
-          return 0
-          ;;
-      esac
-      MIHOMO_GOMEMLIMIT="$cpu_mem"
-      MIHOMO_GOGC="$cpu_gogc"
-      MIHOMO_GOMAXPROCS="$cpu_gomaxprocs"
-      cpu_mode=1
-      ;;
-    6)
       default_mem="${MIHOMO_GOMEMLIMIT:-$recommended_mem}"
       default_gogc="${MIHOMO_GOGC:-$recommended_gogc}"
       default_gomaxprocs="${MIHOMO_GOMAXPROCS:-$recommended_gomaxprocs}"
@@ -3456,18 +3557,10 @@ EOF
   validate_runtime_tuning
   write_runtime_tuning
   apply_runtime_service
-  if [ "$bandwidth_mode" = "1" ]; then
+  if [ "$cleanup_stats_mode" = "1" ]; then
     disable_traffic_auto_refresh >/dev/null 2>&1 || true
     cleanup_user_traffic_rules >/dev/null 2>&1 || true
-    ui_success "已关闭自动流量统计并清理 iptables 统计规则。"
-  fi
-  if [ "$cpu_mode" = "1" ]; then
-    if multi_user_enabled; then
-      refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
-      ui_success "已按协议重建轻量流量统计规则。"
-    else
-      ui_success "多用户管理未启用，无需重建流量统计规则。"
-    fi
+    ui_success "已关闭自动流量统计并清理 iptables 统计规则，降低包路径 CPU 开销。"
   fi
   ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS，GODEBUG=$MIHOMO_GODEBUG。"
 }
