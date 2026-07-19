@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.10.1"
+SCRIPT_VERSION="1.10.1-argo.1"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -38,7 +38,13 @@ MIHOMO_MULTI_USER="${MIHOMO_MULTI_USER:-}"
 HY2_UP_MBPS=10000
 HY2_DOWN_MBPS=10000
 GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/releases/latest}"
-SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/mh.sh}"
+SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/mh.sh}"
+CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
+CLOUDFLARED_CONFIG_DIR="/etc/cloudflared"
+CLOUDFLARED_TOKEN_FILE="$CLOUDFLARED_CONFIG_DIR/token"
+CLOUDFLARED_RUNNER="/usr/local/sbin/cloudflared-tunnel-run"
+CLOUDFLARED_SERVICE="cloudflared-tunnel"
+CLOUDFLARED_LOG="/var/log/cloudflared-tunnel.log"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 
@@ -3749,6 +3755,211 @@ EOF
   esac
 }
 
+cloudflared_status_text() {
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd)
+      systemctl is-active --quiet "$CLOUDFLARED_SERVICE" 2>/dev/null && printf '运行中' || printf '未运行'
+      ;;
+    openrc)
+      rc-service "$CLOUDFLARED_SERVICE" status >/dev/null 2>&1 && printf '运行中' || printf '未运行'
+      ;;
+    *) printf '未知' ;;
+  esac
+}
+
+cloudflared_arch() {
+  machine="$(uname -m)"
+  case "$machine" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    armv7l|armv7) printf 'arm' ;;
+    i386|i486|i586|i686) printf '386' ;;
+    *) return 1 ;;
+  esac
+}
+
+write_cloudflared_runner() {
+  mkdir -p "$(dirname "$CLOUDFLARED_RUNNER")"
+  cat > "$CLOUDFLARED_RUNNER" <<'EOF'
+#!/bin/sh
+set -eu
+TOKEN_FILE="/etc/cloudflared/token"
+[ -s "$TOKEN_FILE" ] || { echo "Cloudflare Tunnel Token 不存在" >&2; exit 1; }
+TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+exec /usr/local/bin/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$TOKEN"
+EOF
+  chmod 700 "$CLOUDFLARED_RUNNER"
+}
+
+write_cloudflared_service() {
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd)
+      cat > "/etc/systemd/system/${CLOUDFLARED_SERVICE}.service" <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Mihomo Lite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$CLOUDFLARED_RUNNER
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload
+      systemctl enable "$CLOUDFLARED_SERVICE" >/dev/null
+      systemctl restart "$CLOUDFLARED_SERVICE"
+      ;;
+    openrc)
+      cat > "/etc/init.d/${CLOUDFLARED_SERVICE}" <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel for Mihomo Lite"
+command="$CLOUDFLARED_RUNNER"
+command_background="yes"
+pidfile="/run/${CLOUDFLARED_SERVICE}.pid"
+output_log="$CLOUDFLARED_LOG"
+error_log="$CLOUDFLARED_LOG"
+respawn_delay=5
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+      chmod +x "/etc/init.d/${CLOUDFLARED_SERVICE}"
+      rc-update add "$CLOUDFLARED_SERVICE" default >/dev/null
+      rc-service "$CLOUDFLARED_SERVICE" restart
+      ;;
+    *)
+      ui_error "未找到 systemd 或 OpenRC，无法创建 Tunnel 服务。"
+      return 1
+      ;;
+  esac
+}
+
+install_cloudflared() {
+  need_root
+  detect_os
+  ensure_curl
+  cf_arch="$(cloudflared_arch)" || {
+    ui_error "暂不支持当前 CPU 架构：$(uname -m)。"
+    return 1
+  }
+
+  ui_prompt "请粘贴 Cloudflare Tunnel Token（输入时隐藏）："
+  if [ -t 0 ]; then
+    old_stty="$(stty -g 2>/dev/null || true)"
+    stty -echo 2>/dev/null || true
+    read -r tunnel_token || true
+    [ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null || true
+    printf '\n'
+  else
+    read -r tunnel_token || true
+  fi
+  tunnel_token="$(printf '%s' "$tunnel_token" | tr -d '\r\n[:space:]')"
+  if [ -z "$tunnel_token" ]; then
+    ui_error "Token 不能为空。"
+    return 1
+  fi
+
+  tmp_file="$(make_temp /tmp/cloudflared.XXXXXX)"
+  cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
+  ui_section "下载 cloudflared (${cf_arch})"
+  if ! curl -fL --retry 3 --connect-timeout 15 "$cf_url" -o "$tmp_file"; then
+    rm -f "$tmp_file"
+    ui_error "cloudflared 下载失败。"
+    return 1
+  fi
+  chmod 755 "$tmp_file"
+  mv "$tmp_file" "$CLOUDFLARED_BIN"
+
+  mkdir -p "$CLOUDFLARED_CONFIG_DIR"
+  printf '%s\n' "$tunnel_token" > "$CLOUDFLARED_TOKEN_FILE"
+  chmod 600 "$CLOUDFLARED_TOKEN_FILE"
+  tunnel_token=""
+
+  write_cloudflared_runner
+  write_cloudflared_service
+  ui_success "Argo 固定隧道已安装并设为开机启动。"
+  ui_warn "下一步：Cloudflare Tunnel 后台添加公共主机名，服务填写 http://127.0.0.1:Mihomo的VLESS-WS端口。"
+  ui_warn "客户端使用域名:443、TLS、相同 Host 和 WebSocket Path；无需映射该 WS 端口，也无需 DDNS。"
+}
+
+restart_cloudflared() {
+  need_root
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd) systemctl restart "$CLOUDFLARED_SERVICE" ;;
+    openrc) rc-service "$CLOUDFLARED_SERVICE" restart ;;
+    *) ui_error "未找到服务管理器。"; return 1 ;;
+  esac
+  ui_success "Argo Tunnel 已重启。"
+}
+
+show_cloudflared_logs() {
+  ui_warn "按 Ctrl+C 停止查看日志。"
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd) journalctl -u "$CLOUDFLARED_SERVICE" -f --no-pager ;;
+    openrc) touch "$CLOUDFLARED_LOG"; tail -F "$CLOUDFLARED_LOG" ;;
+    *) ui_error "未找到服务管理器。"; return 1 ;;
+  esac
+}
+
+uninstall_cloudflared() {
+  need_root
+  ui_prompt "确认卸载 Argo Tunnel？Mihomo 和节点不会被删除 [y/N]："
+  read -r confirm || true
+  case "$confirm" in y|Y|yes|YES) ;; *) ui_warn "已取消。"; return 0 ;; esac
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd)
+      systemctl disable --now "$CLOUDFLARED_SERVICE" 2>/dev/null || true
+      rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE}.service"
+      systemctl daemon-reload 2>/dev/null || true
+      ;;
+    openrc)
+      rc-service "$CLOUDFLARED_SERVICE" stop 2>/dev/null || true
+      rc-update del "$CLOUDFLARED_SERVICE" default 2>/dev/null || true
+      rm -f "/etc/init.d/${CLOUDFLARED_SERVICE}"
+      ;;
+  esac
+  rm -f "$CLOUDFLARED_BIN" "$CLOUDFLARED_RUNNER" "$CLOUDFLARED_TOKEN_FILE" "$CLOUDFLARED_LOG"
+  rmdir "$CLOUDFLARED_CONFIG_DIR" 2>/dev/null || true
+  ui_success "Argo Tunnel 已卸载，Mihomo 未受影响。"
+}
+
+cloudflared_menu() {
+  while true; do
+    screen_title "Argo / Cloudflare Tunnel 管理"
+    cf_status="$(cloudflared_status_text)"
+    printf ' 当前状态：%s\n' "$cf_status"
+    ui_dash
+    printf ' %s1.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
+    printf ' %s2.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
+    printf ' %s3.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
+    printf ' %s4.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
+    ui_dash
+    ui_prompt "请输入数字选择 (0-4)："
+    read -r cf_choice || return 0
+    case "$cf_choice" in
+      1) install_cloudflared; pause ;;
+      2) restart_cloudflared; pause ;;
+      3) show_cloudflared_logs ;;
+      4) uninstall_cloudflared; pause ;;
+      0) return 0 ;;
+      *) ui_error "无效选择。"; pause ;;
+    esac
+  done
+}
+
 update_script() {
   need_root
   ensure_curl
@@ -3836,12 +4047,12 @@ menu() {
     clear 2>/dev/null || true
     current_status="$(service_status_text)"
     multi_user_menu_line=""
-    menu_choices="0-9/22/33/44/55/66"
-    invalid_choices="0-9、22、33、44、55 或 66"
+    menu_choices="0-9/22/33/44/55/66/88"
+    invalid_choices="0-9、22、33、44、55、66 或 88"
     if multi_user_enabled; then
       multi_user_menu_line="   ${C_GREEN}77.${C_RESET} 多用户管理面板"
-      menu_choices="0-9/22/33/44/55/66/77"
-      invalid_choices="0-9、22、33、44、55、66 或 77"
+      menu_choices="0-9/22/33/44/55/66/77/88"
+      invalid_choices="0-9、22、33、44、55、66、77 或 88"
     fi
     
     cat <<EOF
@@ -3874,6 +4085,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}55.${C_RESET} sysctl 网络优化
    ${C_GREEN}66.${C_RESET} IPv6 支持设置
 $multi_user_menu_line
+   ${C_GREEN}88.${C_RESET} Argo / Cloudflare Tunnel 管理
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
 ${C_CYAN}====================================================${C_RESET}
@@ -3896,6 +4108,7 @@ EOF
       44) performance_tuning_menu; pause ;;
       55) optimize_sysctl_network; pause ;;
       66) ipv6_settings_menu; pause ;;
+      88) cloudflared_menu ;;
       77)
         if multi_user_enabled; then
           multi_user_panel; pause
@@ -3918,6 +4131,7 @@ case "${1:-}" in
   apply-runtime|runtime-apply) apply_saved_runtime_service ;;
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
+  argo|tunnel|cloudflared|88) cloudflared_menu ;;
   traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;
   traffic-auto) run_traffic_auto_refresh ;;
   traffic-cron|auto-traffic|traffic-auto-menu) need_root; ensure_installed; traffic_auto_refresh_menu ;;

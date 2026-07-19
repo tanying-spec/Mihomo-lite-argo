@@ -2,7 +2,7 @@
 
 set -u
 
-RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main}"
+RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main}"
 CLI_PATH="/usr/local/bin/mh"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }

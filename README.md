@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.10.1
+# ✨ Mihomo Lite - 一键配置脚本 V1.10.1（Argo 集成版）
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -18,7 +18,7 @@
 请在具有 `root` 权限的终端中执行以下一键安装命令：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/install.sh | sudo sh
 ```
 
 安装完成后输入 `mh` 打开菜单，再选择 `4` 安装 / 更新 Mihomo 内核。
@@ -38,6 +38,13 @@ curl -fsSL https://raw.githubusercontent.com/oKafuChino/Mihomo-lite/main/install
 * **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🔄 无缝升级**：支持一键拉取并更新管理脚本自身，更新后可自动重写服务运行参数。
+* **☁️ Argo Tunnel**：菜单 `88` 可安装/更新 cloudflared、保存固定隧道 Token、设置开机启动、重启、查看日志和独立卸载；支持 systemd 与 Alpine OpenRC。
+
+### ☁️ Argo / Cloudflare Tunnel
+
+安装管理脚本后输入 `mh`，选择 `88`，再选择 `1` 并粘贴 Cloudflare 固定隧道 Token。安装完成后，在 Cloudflare Tunnel 后台添加公共主机名，服务填写 `http://127.0.0.1:<VLESS-WS 本地端口>`。
+
+客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
 
 ### 🛡️ 支持的代理协议
 
