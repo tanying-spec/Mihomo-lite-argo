@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.11.0-argo.2"
+SCRIPT_VERSION="1.11.0-argo.3"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -2055,7 +2055,7 @@ cleanup_user_traffic_rules() {
 
 prompt_node_name() {
   proto_prefix="$1"
-  default_name="$proto_prefix"
+  default_name="${2:-$proto_prefix}"
   ui_prompt "请输入节点名称（默认 $default_name）："
   read -r node_name || true
   if [ -z "$node_name" ]; then
@@ -2369,11 +2369,6 @@ add_anytls_node() {
 
 add_vless_ws_node() {
   screen_title "创建 VLESS + WebSocket 节点"
-  prompt_node_name vless-ws
-  node_name="$SELECTED_NODE_NAME"
-  prompt_port
-  node_port="$SELECTED_NODE_PORT"
-
   cat <<EOF
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}1.${C_RESET} IP 直连 WS（需要公网端口映射）
@@ -2384,6 +2379,18 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
 EOF
   ui_prompt "请选择使用模式 (0-3)："
   read -r ws_mode_choice || true
+
+  case "$ws_mode_choice" in
+    0) ui_warn "已取消创建 VLESS-WS 节点。"; return 0 ;;
+    1|2|3) ;;
+    *) ui_error "无效选择。"; return 1 ;;
+  esac
+
+  ws_default_name="$(unique_node_name vless-ws)"
+  prompt_node_name vless-ws "$ws_default_name"
+  node_name="$SELECTED_NODE_NAME"
+  prompt_port
+  node_port="$SELECTED_NODE_PORT"
 
   ws_host=""
   ws_mode=""
@@ -2431,8 +2438,6 @@ EOF
       ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
       ws_entry_port="443"
       ;;
-    0) ui_warn "已取消创建 VLESS-WS 节点。"; return 0 ;;
-    *) ui_error "无效选择。"; return 1 ;;
   esac
 
   case "$ws_entry_port" in
