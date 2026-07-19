@@ -4,6 +4,7 @@ set -u
 
 RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main}"
 CLI_PATH="/usr/local/bin/mh"
+CLI_BACKUP_PATH="/usr/local/bin/mh.previous"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -59,5 +60,6 @@ if ! sh -n "$tmp_file" 2>/dev/null; then
 fi
 
 chmod +x "$tmp_file"
+[ -f "$CLI_PATH" ] && cp "$CLI_PATH" "$CLI_BACKUP_PATH" && chmod 700 "$CLI_BACKUP_PATH"
 mv "$tmp_file" "$CLI_PATH"
 green "安装完成。现在可以输入 mh 打开管理面板。"

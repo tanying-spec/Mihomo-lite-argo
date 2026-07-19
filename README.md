@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.10.1（Argo 集成版）
+# ✨ Mihomo Lite - 一键配置脚本 V1.11.0（Argo 稳定版）
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 
 通过终端输入 `mh` 即可打开 TUI 菜单，支持以下快捷操作：
 
-* **📦 核心管理**：一键安装 / 卸载 Mihomo 内核至系统目录。
+* **📦 核心管理**：一键安装 / 更新 / 卸载 Mihomo 内核，更新失败自动恢复。
 * **🔗 节点生成**：一键生成代理节点，并自动输出可复制导入的节点链接。
 * **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除、一键清空和批量重命名。
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
@@ -41,14 +41,34 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
 * **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
-* **🔄 无缝升级**：支持一键拉取并更新管理脚本自身，更新后可自动重写服务运行参数。
-* **☁️ Argo Tunnel**：菜单 `88` 可安装/更新 cloudflared、保存固定隧道 Token、设置开机启动、重启、查看日志和独立卸载；支持 systemd 与 Alpine OpenRC。
+* **🛡️ 稳定与回滚**：配置写入前执行 Mihomo 自检，服务失败自动恢复旧配置；内核、cloudflared 和管理脚本均可回滚上一版本。
+* **🔌 端口检查**：同时检查节点数据库、用户数据库和系统真实 TCP/UDP 监听端口。
+* **🔄 无缝升级**：支持一键更新 Mihomo、cloudflared 与管理脚本，菜单 `10` 提供版本回滚。
+* **☁️ Argo Tunnel**：菜单 `88` 使用 `--token-file` 运行固定隧道，支持专用节点、正确 WS-TLS 链接、WebSocket 101 检测、版本/状态/连接数展示和独立卸载。
 
 ### ☁️ Argo / Cloudflare Tunnel
 
-安装管理脚本后输入 `mh`，选择 `88`，再选择 `1` 并粘贴 Cloudflare 固定隧道 Token。安装完成后，在 Cloudflare Tunnel 后台添加公共主机名，服务填写 `http://127.0.0.1:<VLESS-WS 本地端口>`。
+安装管理脚本后输入 `mh`：
+
+1. 选择 `4` 安装 Mihomo。
+2. 选择 `1` → `VLESS + WebSocket` → `Cloudflare Tunnel / Argo` 创建专用节点。该 listener 只绑定 `127.0.0.1`。
+3. 选择 `88` → `1`，粘贴 Cloudflare 固定 Tunnel Token；Token 仅保存在 `/etc/cloudflared/token`（权限 `600`），cloudflared 通过 `--token-file` 读取。
+4. 在 Cloudflare Tunnel 后台添加公共主机名，服务填写脚本显示的 `http://127.0.0.1:<VLESS-WS 本地端口>`。
+5. 使用菜单 `88` 的本地和公网检测，二者都应返回 `HTTP/1.1 101 Switching Protocols`。
 
 客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
+
+> **重要：Argo 公共主机名不要提前创建 A/AAAA 记录。** 在 Tunnel 路由中保存公共主机名后，Cloudflare 会自动创建指向 `*.cfargotunnel.com` 的 CNAME。若已存在同名 A/AAAA，请先删除冲突记录。
+
+### VLESS-WS 三种模式
+
+| 模式 | 是否输入域名 | 本地监听 | NAT 映射 | DNS 要点 |
+| :--- | :--- | :--- | :--- | :--- |
+| IP 直连 WS | 否 | 公网监听 | 需要 | 使用公网 IP 和映射端口 |
+| Cloudflare CDN WS-TLS | 是 | 公网监听 | 需要，且入口端口需受 Cloudflare 支持 | 创建代理 DNS 记录指向公网 IP |
+| Argo Tunnel WS-TLS | 是（Tunnel 公共主机名） | `127.0.0.1` | 不需要 | 不预建 A/AAAA，由 Tunnel 自动创建 CNAME |
+
+脚本生成 Argo 链接时会自动使用入口 `443`、`security=tls`、正确的 `sni`、`host` 和 WebSocket `path`；可另填 Cloudflare 优选域名/IP 作为客户端入口，但 SNI/Host 始终保持 Tunnel 公共主机名。
 
 ### 🛡️ 支持的代理协议
 
@@ -81,6 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 | :--- | :--- | :--- |
 | **管理面板命令** | `/usr/local/bin/mh` | 终端快捷启动命令 |
 | **Mihomo 内核** | `/usr/local/bin/mihomo` | 核心可执行文件 |
+| **Mihomo 上一版本** | `/usr/local/bin/mihomo.previous` | 菜单 `10` 回滚使用 |
 | **配置主目录** | `/etc/mihomo/` | 存储运行所需的各项配置 |
 | **主配置文件** | `/etc/mihomo/config.yaml` | Mihomo 运行的源配置 |
 | **节点数据库** | `/etc/mihomo/nodes.db` | 本地化存储已生成的节点记录 |
@@ -92,6 +113,8 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 | **运行参数** | `/etc/mihomo/runtime.env` | 存储 `GOMEMLIMIT`、`GOGC`、`GOMAXPROCS` 与 `GODEBUG` |
 | **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
 | **公网 IP 缓存** | `/etc/mihomo/public.ip` | 缓存 IPv4 / IPv6 分享地址，默认 6 小时自动过期 |
+| **cloudflared Token** | `/etc/cloudflared/token` | 固定隧道 Token，权限 `600` |
+| **cloudflared Metrics** | `127.0.0.1:20241` | 仅本机状态与活跃连接统计 |
 | **日志目录** | `/var/log/mihomo/` | 存储服务的运行与连接日志 |
 
 *💡 后台守护服务名称：`mihomo`*
@@ -108,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 * `GOMAXPROCS` 会优先按 cgroup CPU 配额推荐，避免 LXC 容器误用宿主机 CPU 数导致调度开销过高。
 * 当检测到 cgroup CPU quota 小于 1 核时，脚本会按 CPU 严重受限容器处理：限制 `GOMAXPROCS=1`，提高 `GOGC`，减少调度和 GC 额外开销。
 * 后续可通过菜单 `44` 随时切换运行时性能档位；其中省资源稳连和高吞吐/跑满带宽模式会关闭自动流量统计并移除 iptables 统计规则，减少包路径开销。
-* 菜单 `55` 可尝试应用网络栈优化；容器无权限的 sysctl 项会被跳过。
+* 菜单 `55` 可尝试应用网络栈优化；容器无权限的 sysctl 项会被跳过，首次修改前会记录原值，完整卸载时恢复。
 * 未检测到明确内存限制时，Alpine 使用更保守推荐值，Debian / Ubuntu 使用略高推荐值；检测到 128/256/512MiB 等小内存容器时会自动下调 `GOMEMLIMIT`，同时避免把 `GOGC` 压得过低导致 CPU 消耗过高。
 
 也可以通过环境变量直接指定并重写服务：
