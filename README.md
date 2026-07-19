@@ -42,19 +42,21 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 * **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🛡️ 稳定与回滚**：配置写入前执行 Mihomo 自检，服务失败自动恢复旧配置；内核、cloudflared 和管理脚本均可回滚上一版本。
+* **🧱 状态事务**：节点与多用户的重要修改使用数据库快照、并发锁和中断恢复，失败不会留下半写入状态。
 * **🔌 端口检查**：同时检查节点数据库、用户数据库和系统真实 TCP/UDP 监听端口。
 * **🔄 无缝升级**：支持一键更新 Mihomo、cloudflared 与管理脚本，菜单 `10` 提供版本回滚。
-* **☁️ Argo Tunnel**：菜单 `88` 使用 `--token-file` 运行固定隧道，支持专用节点、正确 WS-TLS 链接、WebSocket 101 检测、版本/状态/连接数展示和独立卸载。
+* **🩺 健康检查**：菜单 `11` 或命令 `mh doctor` 检查配置、服务、数据库、监听端口、Tunnel 连接和 Token 权限。
+* **☁️ Argo Tunnel**：菜单 `88` 提供真正的一键 Argo 节点，使用 `--token-file` 运行固定隧道，并支持正确 WS-TLS 链接、WebSocket 101 检测、版本/状态/连接数展示和独立卸载。
 
 ### ☁️ Argo / Cloudflare Tunnel
 
 安装管理脚本后输入 `mh`：
 
 1. 选择 `4` 安装 Mihomo。
-2. 选择 `1` → `VLESS + WebSocket` → `Cloudflare Tunnel / Argo` 创建专用节点。该 listener 只绑定 `127.0.0.1`。
-3. 选择 `88` → `1`，粘贴 Cloudflare 固定 Tunnel Token；Token 仅保存在 `/etc/cloudflared/token`（权限 `600`），cloudflared 通过 `--token-file` 读取。
+2. 选择 `88` → `2`，粘贴 Cloudflare 固定 Tunnel Token；Token 仅保存在 `/etc/cloudflared/token`（权限 `600`），cloudflared 通过 `--token-file` 读取。
+3. 选择 `88` → `1` 一键创建 Argo VLESS-WS 节点：只需填写 Tunnel 公共主机名，名称、无冲突端口、UUID 和随机 Path 均可自动生成，listener 只绑定 `127.0.0.1`。
 4. 在 Cloudflare Tunnel 后台添加公共主机名，服务填写脚本显示的 `http://127.0.0.1:<VLESS-WS 本地端口>`。
-5. 使用菜单 `88` 的本地和公网检测，二者都应返回 `HTTP/1.1 101 Switching Protocols`。
+5. 使用菜单 `88` → `5/6` 执行本地和公网检测，二者都应返回 `HTTP/1.1 101 Switching Protocols`。
 
 客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
 

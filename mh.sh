@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.11.0-argo.3"
+SCRIPT_VERSION="1.11.0-argo.4"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -13,6 +13,7 @@ CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 CONFIG_BACKUP_FILE="$CONFIG_DIR/config.yaml.previous"
 CONFIG_PENDING_FILE="$CONFIG_DIR/.config-pending"
+STATE_LOCK_DIR="$CONFIG_DIR/state.lock"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
 TRAFFIC_DB="$CONFIG_DIR/traffic.db"
@@ -860,6 +861,23 @@ sanitize_sni_field() {
   printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'
 }
 
+is_valid_hostname() {
+  hostname_value="$1"
+  [ "${#hostname_value}" -le 253 ] || return 1
+  printf '%s\n' "$hostname_value" | awk -F'.' '
+    NF < 2 { exit 1 }
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "" || length($i) > 63 || $i !~ /^[A-Za-z0-9-]+$/ || $i ~ /^-/ || $i ~ /-$/) exit 1
+      }
+    }
+  '
+}
+
+is_valid_endpoint() {
+  is_ipv4 "$1" || is_ipv6 "$1" || is_valid_hostname "$1"
+}
+
 yaml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -964,7 +982,7 @@ latest_download_url() {
 
 rand_alnum() {
   length="${1:-32}"
-  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$length"
+  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c "$length"
 }
 
 rand_hex() {
@@ -2064,12 +2082,12 @@ prompt_node_name() {
   node_name="$(printf '%s' "$node_name" | tr -cd 'A-Za-z0-9_.-')"
   if [ -z "$node_name" ]; then
     red "节点名称无效，只能包含字母、数字、下划线、点和短横线。"
-    exit 1
+    return 1
   fi
 
   if node_name_exists "$node_name"; then
     red "节点 $node_name 已存在。"
-    exit 1
+    return 1
   fi
   SELECTED_NODE_NAME="$node_name"
 }
@@ -2083,35 +2101,106 @@ prompt_port() {
   case "$node_port" in
     ''|*[!0-9]*)
       red "端口必须是数字。"
-      exit 1
+      return 1
       ;;
   esac
   if [ "$node_port" -lt 1 ] || [ "$node_port" -gt 65535 ]; then
     red "端口范围必须为 1-65535。"
-    exit 1
+    return 1
   fi
 
   if port_in_use "$node_port"; then
     red "端口 $node_port 已被其他节点、用户或系统进程占用。"
-    exit 1
+    return 1
   fi
   SELECTED_NODE_PORT="$node_port"
 }
 
 append_node() {
-  nodes_snapshot="$(make_temp "$CONFIG_DIR/nodes-backup.XXXXXX")"
-  cp "$NODES_DB" "$nodes_snapshot" 2>/dev/null || : > "$nodes_snapshot"
+  state_transaction_begin || return 1
   printf '%s\n' "$1" >> "$NODES_DB"
   chmod 600 "$NODES_DB"
-  if ! render_config || ! restart_service; then
-    mv "$nodes_snapshot" "$NODES_DB"
-    chmod 600 "$NODES_DB"
-    render_config >/dev/null 2>&1 || true
-    restart_service >/dev/null 2>&1 || true
-    ui_warn "节点数据库已自动恢复。"
-    return 1
+  state_transaction_apply
+}
+
+state_transaction_begin() {
+  mkdir -p "$CONFIG_DIR"
+  if ! mkdir "$STATE_LOCK_DIR" 2>/dev/null; then
+    state_lock_pid="$(cat "$STATE_LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$state_lock_pid" in ''|*[!0-9]*) state_lock_alive=0 ;; *) if kill -0 "$state_lock_pid" 2>/dev/null; then state_lock_alive=1; else state_lock_alive=0; fi ;; esac
+    if [ "$state_lock_alive" = "1" ]; then
+      ui_error "另一个 mh 进程正在修改配置（PID $state_lock_pid），请稍后重试。"
+      return 1
+    fi
+    stale_tx_dir="$(cat "$STATE_LOCK_DIR/txdir" 2>/dev/null || true)"
+    case "$stale_tx_dir" in
+      "$CONFIG_DIR"/.state-tx.*)
+        if [ -d "$stale_tx_dir" ]; then
+          STATE_TX_DIR="$stale_tx_dir"
+          state_transaction_restore_files
+          rm -rf "$stale_tx_dir"
+          ui_warn "检测到上次未完成的配置操作，已恢复数据库快照。"
+        fi
+        ;;
+    esac
+    rm -rf "$STATE_LOCK_DIR"
+    mkdir "$STATE_LOCK_DIR" 2>/dev/null || { ui_error "无法取得配置修改锁。"; return 1; }
   fi
-  rm -f "$nodes_snapshot"
+  printf '%s\n' "$$" > "$STATE_LOCK_DIR/pid"
+  STATE_TX_DIR="$(mktemp -d "$CONFIG_DIR/.state-tx.XXXXXX" 2>/dev/null)" || {
+    rm -rf "$STATE_LOCK_DIR"
+    ui_error "无法创建状态事务目录。"
+    return 1
+  }
+  printf '%s\n' "$STATE_TX_DIR" > "$STATE_LOCK_DIR/txdir"
+  for state_file in nodes.db users.db traffic.db; do
+    if [ -e "$CONFIG_DIR/$state_file" ]; then
+      cp "$CONFIG_DIR/$state_file" "$STATE_TX_DIR/$state_file"
+    else
+      : > "$STATE_TX_DIR/$state_file.missing"
+    fi
+  done
+  trap 'state_transaction_abort' HUP INT TERM
+}
+
+state_transaction_commit() {
+  [ -n "${STATE_TX_DIR:-}" ] && [ -d "$STATE_TX_DIR" ] && rm -rf "$STATE_TX_DIR"
+  rm -rf "$STATE_LOCK_DIR"
+  STATE_TX_DIR=""
+  trap - HUP INT TERM
+}
+
+state_transaction_abort() {
+  state_transaction_restore_files
+  state_transaction_commit
+  ui_error "操作被中断，数据库已恢复。"
+  exit 130
+}
+
+state_transaction_restore_files() {
+  [ -n "${STATE_TX_DIR:-}" ] && [ -d "$STATE_TX_DIR" ] || return 0
+  for state_file in nodes.db users.db traffic.db; do
+    if [ -f "$STATE_TX_DIR/$state_file" ]; then
+      cp "$STATE_TX_DIR/$state_file" "$CONFIG_DIR/$state_file"
+      chmod 600 "$CONFIG_DIR/$state_file"
+    elif [ -f "$STATE_TX_DIR/$state_file.missing" ]; then
+      rm -f "$CONFIG_DIR/$state_file"
+    fi
+  done
+}
+
+state_transaction_apply() {
+  if render_config && restart_service; then
+    state_transaction_commit
+    return 0
+  fi
+  ui_error "状态变更未能安全生效，正在恢复节点和用户数据库。"
+  state_transaction_restore_files
+  render_config >/dev/null 2>&1 || true
+  restart_service >/dev/null 2>&1 || true
+  state_transaction_commit
+  ui_warn "数据库与运行配置已恢复到操作前状态。"
+  return 1
 }
 
 append_node_record() {
@@ -2294,9 +2383,9 @@ EOF
 
 add_vless_reality_node() {
   screen_title "创建 VLESS + Reality 节点"
-  prompt_node_name vless-reality
+  prompt_node_name vless-reality || return 1
   node_name="$SELECTED_NODE_NAME"
-  prompt_port
+  prompt_port || return 1
   node_port="$SELECTED_NODE_PORT"
   ui_prompt "请输入 Reality SNI（默认 www.amd.com）："
   read -r sni || true
@@ -2316,9 +2405,9 @@ add_vless_reality_node() {
 
 add_hysteria2_node() {
   screen_title "创建 Hysteria2 节点"
-  prompt_node_name hy2
+  prompt_node_name hy2 || return 1
   node_name="$SELECTED_NODE_NAME"
-  prompt_port
+  prompt_port || return 1
   node_port="$SELECTED_NODE_PORT"
   ui_prompt "请输入 TLS SNI / 证书域名（默认 www.amd.com）："
   read -r sni || true
@@ -2349,9 +2438,9 @@ add_hysteria2_node() {
 
 add_anytls_node() {
   screen_title "创建 AnyTLS 节点"
-  prompt_node_name anytls
+  prompt_node_name anytls || return 1
   node_name="$SELECTED_NODE_NAME"
-  prompt_port
+  prompt_port || return 1
   node_port="$SELECTED_NODE_PORT"
   ui_prompt "请输入 TLS SNI / 证书域名（默认 www.amd.com）："
   read -r sni || true
@@ -2387,9 +2476,9 @@ EOF
   esac
 
   ws_default_name="$(unique_node_name vless-ws)"
-  prompt_node_name vless-ws "$ws_default_name"
+  prompt_node_name vless-ws "$ws_default_name" || return 1
   node_name="$SELECTED_NODE_NAME"
-  prompt_port
+  prompt_port || return 1
   node_port="$SELECTED_NODE_PORT"
 
   ws_host=""
@@ -2416,11 +2505,12 @@ EOF
       ui_prompt "请输入 Cloudflare 真实域名（用于 SNI/Host）："
       read -r ws_host || true
       ws_host="$(sanitize_sni_field "$ws_host")"
-      [ -n "$ws_host" ] || { ui_error "小黄云模式必须填写域名。"; return 1; }
+      is_valid_hostname "$ws_host" || { ui_error "小黄云模式必须填写有效的完整域名。"; return 1; }
       ui_prompt "请输入 CDN 入口地址（默认 $ws_host，可填写优选域名/IP）："
       read -r ws_entry_address || true
       [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
       ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
+      is_valid_endpoint "$ws_entry_address" || { ui_error "CDN 入口必须是有效域名或 IP。"; return 1; }
       ui_prompt "请输入 CDN 入口端口（默认 443）："
       read -r ws_entry_port || true
       [ -n "$ws_entry_port" ] || ws_entry_port="443"
@@ -2431,11 +2521,12 @@ EOF
       ui_prompt "请输入计划使用的 Tunnel 公共主机名："
       read -r ws_host || true
       ws_host="$(sanitize_sni_field "$ws_host")"
-      [ -n "$ws_host" ] || { ui_error "Argo 模式必须填写公共主机名。"; return 1; }
+      is_valid_hostname "$ws_host" || { ui_error "Argo 模式必须填写有效的 Tunnel 公共主机名。"; return 1; }
       ui_prompt "请输入客户端入口地址（默认 $ws_host，可填写优选域名/IP）："
       read -r ws_entry_address || true
       [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
       ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
+      is_valid_endpoint "$ws_entry_address" || { ui_error "客户端入口必须是有效域名或 IP。"; return 1; }
       ws_entry_port="443"
       ;;
   esac
@@ -2497,11 +2588,11 @@ add_combo_nodes() {
   anytls_cert_file="${anytls_cert_pair%%|*}"
   anytls_key_file="${anytls_cert_pair#*|}"
 
+  state_transaction_begin || return 1
   append_node_record "vless-reality|$reality_name|$reality_port|$reality_uuid|$sni|$reality_dest|$reality_private_key|$reality_public_key|$reality_short_id"
   append_node_record "hysteria2|$hy2_name|$hy2_port|$hy2_password|$sni|$hy2_cert_file|$hy2_key_file||"
   append_node_record "anytls|$anytls_name|$anytls_port|$anytls_password|$sni|$anytls_cert_file|$anytls_key_file||"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
 
   SHARE_SERVER_IP="$(public_ip)"
   export SHARE_SERVER_IP
@@ -2584,6 +2675,7 @@ rename_all_nodes() {
     esac
   done < "$NODES_DB"
 
+  state_transaction_begin || { rm -f "$tmp_file" "$rename_map_file"; return 1; }
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
   if [ -s "$USERS_DB" ]; then
@@ -2605,8 +2697,7 @@ rename_all_nodes() {
     chmod 600 "$USERS_DB"
   fi
   rm -f "$rename_map_file"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   ui_success "所有节点已按 ${country_emoji}${country_name}-${provider}-协议 格式重命名。"
 }
 
@@ -2637,7 +2728,7 @@ EOF
     3) add_anytls_node ;;
     4) add_vless_ws_node ;;
     0) return 0 ;;
-    *) red "无效选择。"; exit 1 ;;
+    *) ui_error "无效选择。"; return 1 ;;
   esac
 }
 
@@ -2736,6 +2827,7 @@ delete_node() {
         return 0
         ;;
     esac
+    state_transaction_begin || return 1
     : > "$NODES_DB"
     chmod 600 "$NODES_DB"
     if multi_user_enabled && [ -f "$USERS_DB" ]; then
@@ -2743,8 +2835,7 @@ delete_node() {
       chmod 600 "$USERS_DB"
       reset_user_traffic_snapshot
     fi
-    render_config || return 1
-    restart_service || return 1
+    state_transaction_apply || return 1
     refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
     ui_success "所有节点已删除，服务已重启。"
     return 0
@@ -2771,6 +2862,7 @@ delete_node() {
       ;;
   esac
 
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
   awk -F'|' -v n="$choice" '
     $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
@@ -2784,8 +2876,7 @@ delete_node() {
   if multi_user_enabled; then
     remove_users_for_node "$deleted"
   fi
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "节点 $deleted 已删除，服务已重启。"
 }
@@ -2915,11 +3006,11 @@ EOF
   fi
 
   user_created="$(today_ymd)"
+  state_transaction_begin || return 1
   printf '%s|%s|%s|%s|%s|%s|0|1|%s||%s\n' \
     "$user_name" "$user_node_name" "$user_proto" "$user_credential" "$user_expire" "$user_quota" "$user_created" "$user_port" >> "$USERS_DB"
   chmod 600 "$USERS_DB"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已添加并重载服务。"
   SHARE_SERVER_IP="$(public_ip)"
@@ -2954,12 +3045,12 @@ delete_multi_user() {
     *) ui_warn "已取消删除。"; return 0 ;;
   esac
 
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   awk -F'|' -v n="$user_choice" 'NF >= 9 { i++; if (i == n) next } { print }' "$USERS_DB" > "$tmp_file"
   mv "$tmp_file" "$USERS_DB"
   chmod 600 "$USERS_DB"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已删除并重载服务。"
 }
@@ -2986,6 +3077,7 @@ set_multi_user_enabled_state() {
     return 1
   fi
   user_name="${user_record%%|*}"
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   awk -F'|' -v n="$user_choice" -v enabled="$target_enabled" '
     BEGIN { OFS = FS }
@@ -2997,8 +3089,7 @@ set_multi_user_enabled_state() {
   ' "$USERS_DB" > "$tmp_file"
   mv "$tmp_file" "$USERS_DB"
   chmod 600 "$USERS_DB"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 已更新为 $action_text。"
 }
@@ -3052,6 +3143,7 @@ EOF
     }
   fi
 
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   awk -F'|' -v n="$user_choice" -v expire="$new_expire" -v quota="$new_quota" '
     BEGIN { OFS = FS }
@@ -3066,8 +3158,7 @@ EOF
   ' "$USERS_DB" > "$tmp_file"
   mv "$tmp_file" "$USERS_DB"
   chmod 600 "$USERS_DB"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 的到期/配额已更新。"
 }
@@ -3378,6 +3469,7 @@ reset_multi_user_traffic() {
   IFS='|' read -r user_name user_node user_proto user_credential user_expire user_quota user_used user_enabled user_created user_note user_port user_extra <<EOF
 $user_record
 EOF
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   tmp_traffic="$(make_temp "$CONFIG_DIR/traffic.XXXXXX")"
   awk -F'|' -v n="$user_choice" '
@@ -3403,8 +3495,7 @@ EOF
     reset_user_traffic_snapshot
   fi
   chmod 600 "$TRAFFIC_DB"
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 的已用流量已重置。"
 }
@@ -3453,6 +3544,7 @@ EOF
     fi
   fi
 
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
   awk -F'|' -v n="$user_choice" -v port="$new_port" '
     BEGIN { OFS = FS }
@@ -3468,8 +3560,7 @@ EOF
   mv "$tmp_file" "$USERS_DB"
   chmod 600 "$USERS_DB"
   reset_user_traffic_snapshot
-  render_config || return 1
-  restart_service || return 1
+  state_transaction_apply || return 1
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "用户 $user_name 的端口已更新为 $new_port，流量快照已重置。"
 }
@@ -4333,6 +4424,42 @@ select_vless_ws_node() {
   SELECTED_WS_INDEX="$ws_choice"
 }
 
+create_argo_node() {
+  need_root
+  ensure_installed
+  screen_title "一键创建 Argo VLESS-WS 节点"
+  ui_warn "不要提前创建同名 A/AAAA；Tunnel 路由保存后应由 Cloudflare 自动创建 CNAME。"
+  ui_prompt "请输入 Tunnel 公共主机名（例如 argo.example.com）："
+  read -r ws_host || true
+  ws_host="$(sanitize_sni_field "$ws_host")"
+  is_valid_hostname "$ws_host" || { ui_error "请输入有效的完整公共主机名。"; return 1; }
+
+  ws_default_name="$(unique_node_name argo-vless-ws)"
+  prompt_node_name argo-vless-ws "$ws_default_name" || return 1
+  node_name="$SELECTED_NODE_NAME"
+  node_port="$(unique_port)"
+  node_uuid="$(new_uuid)"
+  ws_path="/$(rand_alnum 16)"
+
+  ui_prompt "请输入客户端入口地址（默认 $ws_host，可填写优选域名/IP）："
+  read -r ws_entry_address || true
+  [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
+  ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
+  is_valid_endpoint "$ws_entry_address" || { ui_error "客户端入口必须是有效域名或 IP。"; return 1; }
+
+  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path|$ws_host|argo|$ws_entry_address|443" || return 1
+  ui_success "Argo 专用节点已创建，并仅监听 127.0.0.1:$node_port。"
+  printf ' 公共主机名：%s\n 服务地址：http://127.0.0.1:%s\n WebSocket Path：%s\n' "$ws_host" "$node_port" "$ws_path"
+  ui_warn "请在 Cloudflare Tunnel 后台添加以上公共主机名和服务地址。"
+  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "argo" "$ws_entry_address" "443"
+
+  if [ "$(cloudflared_status_text)" = "运行中" ]; then
+    websocket_probe "http://127.0.0.1:$node_port$ws_path" "$ws_host" || true
+  else
+    ui_warn "cloudflared 尚未运行；可返回菜单选择安装/更新 Tunnel Token。"
+  fi
+}
+
 configure_argo_node() {
   need_root
   ensure_installed
@@ -4347,14 +4474,14 @@ EOF
   read -r ws_host || true
   [ -n "$ws_host" ] || ws_host="$old_host"
   ws_host="$(sanitize_sni_field "$ws_host")"
-  [ -n "$ws_host" ] || { ui_error "公共主机名不能为空。"; return 1; }
+  is_valid_hostname "$ws_host" || { ui_error "请输入有效的完整公共主机名。"; return 1; }
   ui_prompt "请输入客户端入口地址（默认 $ws_host，可填写优选域名/IP）："
   read -r ws_entry_address || true
   [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
   ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
+  is_valid_endpoint "$ws_entry_address" || { ui_error "客户端入口必须是有效域名或 IP。"; return 1; }
 
-  nodes_snapshot="$(make_temp "$CONFIG_DIR/nodes-backup.XXXXXX")"
-  cp "$NODES_DB" "$nodes_snapshot"
+  state_transaction_begin || return 1
   tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
   awk -F'|' -v n="$SELECTED_WS_INDEX" -v host="$ws_host" -v entry="$ws_entry_address" '
     BEGIN { OFS = FS }
@@ -4371,15 +4498,7 @@ EOF
   ' "$NODES_DB" > "$tmp_file"
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
-  if ! render_config || ! restart_service; then
-    mv "$nodes_snapshot" "$NODES_DB"
-    chmod 600 "$NODES_DB"
-    render_config >/dev/null 2>&1 || true
-    restart_service >/dev/null 2>&1 || true
-    ui_error "Argo 节点转换失败，已恢复节点数据库和运行配置。"
-    return 1
-  fi
-  rm -f "$nodes_snapshot"
+  state_transaction_apply || return 1
 
   ui_success "节点 $node_name 已切换为 Argo 模式，并仅监听 127.0.0.1:$node_port。"
   ui_warn "Cloudflare Tunnel 路由填写："
@@ -4457,29 +4576,31 @@ cloudflared_menu() {
     printf ' 当前状态：%s | 版本：%s | 活跃连接：%s\n' "$cf_status" "$cf_version" "$cf_connections"
     printf ' Metrics：%s（仅本机）\n' "$CLOUDFLARED_METRICS_URL"
     ui_dash
-    printf ' %s1.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
-    printf ' %s2.%s 配置/转换 Argo 专用 VLESS-WS 节点\n' "$C_GREEN" "$C_RESET"
-    printf ' %s3.%s 查看 Argo 节点、路由信息和链接\n' "$C_GREEN" "$C_RESET"
-    printf ' %s4.%s 检测本地 WebSocket 101\n' "$C_GREEN" "$C_RESET"
-    printf ' %s5.%s 检测公网 Tunnel WebSocket 101\n' "$C_GREEN" "$C_RESET"
-    printf ' %s6.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
-    printf ' %s7.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
-    printf ' %s8.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
-    printf ' %s9.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s1.%s 一键创建 Argo VLESS-WS 节点\n' "$C_GREEN" "$C_RESET"
+    printf ' %s2.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
+    printf ' %s3.%s 将已有 VLESS-WS 转换为 Argo\n' "$C_GREEN" "$C_RESET"
+    printf ' %s4.%s 查看 Argo 节点、路由信息和链接\n' "$C_GREEN" "$C_RESET"
+    printf ' %s5.%s 检测本地 WebSocket 101\n' "$C_GREEN" "$C_RESET"
+    printf ' %s6.%s 检测公网 Tunnel WebSocket 101\n' "$C_GREEN" "$C_RESET"
+    printf ' %s7.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
+    printf ' %s8.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
+    printf ' %s9.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
+    printf ' %s10.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
     printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
     ui_dash
-    ui_prompt "请输入数字选择 (0-9)："
+    ui_prompt "请输入数字选择 (0-10)："
     read -r cf_choice || return 0
     case "$cf_choice" in
-      1) install_cloudflared; pause ;;
-      2) configure_argo_node; pause ;;
-      3) show_argo_nodes; pause ;;
-      4) test_argo_node local; pause ;;
-      5) test_argo_node public; pause ;;
-      6) restart_cloudflared; pause ;;
-      7) show_cloudflared_logs ;;
-      8) rollback_cloudflared; pause ;;
-      9) uninstall_cloudflared; pause ;;
+      1) create_argo_node; pause ;;
+      2) install_cloudflared; pause ;;
+      3) configure_argo_node; pause ;;
+      4) show_argo_nodes; pause ;;
+      5) test_argo_node local; pause ;;
+      6) test_argo_node public; pause ;;
+      7) restart_cloudflared; pause ;;
+      8) show_cloudflared_logs ;;
+      9) rollback_cloudflared; pause ;;
+      10) uninstall_cloudflared; pause ;;
       0) return 0 ;;
       *) ui_error "无效选择。"; pause ;;
     esac
@@ -4566,6 +4687,82 @@ version_rollback_menu() {
   esac
 }
 
+health_check() {
+  screen_title "系统健康检查"
+  health_errors=0
+  health_warnings=0
+
+  if [ -x "$BIN_PATH" ] && [ -f "$CONFIG_FILE" ] && "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$CONFIG_FILE" >/dev/null 2>&1; then
+    ui_success "Mihomo 配置语法正常。"
+  else
+    ui_error "Mihomo 配置自检失败或内核/配置不存在。"
+    health_errors=$((health_errors + 1))
+  fi
+  if service_is_running; then
+    ui_success "Mihomo 服务正在运行。"
+  else
+    ui_error "Mihomo 服务未运行。"
+    health_errors=$((health_errors + 1))
+  fi
+
+  malformed_nodes="$(awk -F'|' 'NF && NF != 9 { count++ } END { print count + 0 }' "$NODES_DB" 2>/dev/null)"
+  duplicate_names="$(awk -F'|' 'NF { count[$2]++ } END { for (n in count) if (count[n] > 1) duplicate++ ; print duplicate + 0 }' "$NODES_DB" 2>/dev/null)"
+  duplicate_ports="$(awk -F'|' 'NF { count[$3]++ } END { for (p in count) if (count[p] > 1) duplicate++ ; print duplicate + 0 }' "$NODES_DB" 2>/dev/null)"
+  malformed_nodes="${malformed_nodes:-0}"
+  duplicate_names="${duplicate_names:-0}"
+  duplicate_ports="${duplicate_ports:-0}"
+  if [ "$malformed_nodes" = "0" ] && [ "$duplicate_names" = "0" ] && [ "$duplicate_ports" = "0" ]; then
+    ui_success "节点数据库结构、名称和端口未发现冲突。"
+  else
+    ui_error "节点数据库异常：格式错误 $malformed_nodes，重名 $duplicate_names，重复端口 $duplicate_ports。"
+    health_errors=$((health_errors + 1))
+  fi
+
+  missing_listeners=0
+  if [ -s "$NODES_DB" ]; then
+    while IFS='|' read -r check_proto check_name check_port _; do
+      case "$check_port" in ''|*[!0-9]*) continue ;; esac
+      system_port_in_use "$check_port" || missing_listeners=$((missing_listeners + 1))
+    done < "$NODES_DB"
+  fi
+  if [ "$missing_listeners" -eq 0 ]; then
+    ui_success "所有节点监听端口均可在系统中找到。"
+  else
+    ui_error "有 $missing_listeners 个节点端口未监听。"
+    health_errors=$((health_errors + 1))
+  fi
+
+  if [ -x "$CLOUDFLARED_BIN" ] || [ -s "$CLOUDFLARED_TOKEN_FILE" ]; then
+    if cloudflared_service_is_running; then
+      ui_success "cloudflared 正在运行，活跃连接：$(cloudflared_connection_count)。"
+    else
+      ui_error "检测到 Tunnel 配置，但 cloudflared 未运行。"
+      health_errors=$((health_errors + 1))
+    fi
+    token_mode="$(stat -c '%a' "$CLOUDFLARED_TOKEN_FILE" 2>/dev/null || true)"
+    if [ "$token_mode" = "600" ]; then
+      ui_success "Tunnel Token 权限为 600。"
+    else
+      ui_warn "Tunnel Token 权限不是 600（当前 ${token_mode:-未知}）。"
+      health_warnings=$((health_warnings + 1))
+    fi
+  fi
+
+  if [ -d "$STATE_LOCK_DIR" ]; then
+    lock_pid="$(cat "$STATE_LOCK_DIR/pid" 2>/dev/null || true)"
+    ui_warn "发现配置修改锁（PID ${lock_pid:-未知}）；若没有其他 mh 进程，下次修改时会自动恢复。"
+    health_warnings=$((health_warnings + 1))
+  fi
+
+  ui_dash
+  if [ "$health_errors" -eq 0 ]; then
+    ui_success "健康检查完成：0 个错误，$health_warnings 个警告。"
+    return 0
+  fi
+  ui_error "健康检查完成：$health_errors 个错误，$health_warnings 个警告。"
+  return 1
+}
+
 uninstall_all() {
   need_root
   screen_title "彻底卸载脚本"
@@ -4616,12 +4813,12 @@ menu() {
     clear 2>/dev/null || true
     current_status="$(service_status_text)"
     multi_user_menu_line=""
-    menu_choices="0-10/22/33/44/55/66/88"
-    invalid_choices="0-10、22、33、44、55、66 或 88"
+    menu_choices="0-11/22/33/44/55/66/88"
+    invalid_choices="0-11、22、33、44、55、66 或 88"
     if multi_user_enabled; then
       multi_user_menu_line="   ${C_GREEN}77.${C_RESET} 多用户管理面板"
-      menu_choices="0-10/22/33/44/55/66/77/88"
-      invalid_choices="0-10、22、33、44、55、66、77 或 88"
+      menu_choices="0-11/22/33/44/55/66/77/88"
+      invalid_choices="0-11、22、33、44、55、66、77 或 88"
     fi
     
     cat <<EOF
@@ -4648,6 +4845,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}7.${C_RESET} 查看 YAML 配置文件
    ${C_GREEN}8.${C_RESET} 重启 Mihomo 服务
    ${C_GREEN}9.${C_RESET} 查看服务实时日志
+   ${C_GREEN}11.${C_RESET} 一键系统健康检查
 
   ${C_YELLOW}[+] 其他功能${C_RESET}
    ${C_GREEN}22.${C_RESET} 一键生成 Reality + Hysteria2 + AnyTLS
@@ -4675,6 +4873,7 @@ EOF
       8) need_root; ensure_installed; clear 2>/dev/null || true; ui_title "重启 Mihomo 服务"; if restart_service; then ui_success "服务已重启。"; else ui_error "服务重启失败，请查看日志。"; fi; pause ;;
       9) show_logs ;;
       10) version_rollback_menu; pause ;;
+      11) health_check; pause ;;
       22) add_combo_nodes; pause ;;
       33) rename_all_nodes; pause ;;
       44) performance_tuning_menu; pause ;;
@@ -4716,6 +4915,7 @@ case "${1:-}" in
   logs|log) show_logs ;;
   update) update_script ;;
   rollback) version_rollback_menu ;;
+  check|health|doctor) health_check ;;
   uninstall) uninstall_all ;;
   *) menu ;;
 esac
