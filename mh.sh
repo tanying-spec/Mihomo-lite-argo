@@ -3,7 +3,8 @@
 set -u
 
 SCRIPT_AUTHOR="oKafuChino"
-SCRIPT_VERSION="1.10.1-argo.1"
+SCRIPT_OPTIMIZER="TANYING"
+SCRIPT_VERSION="1.10.1-argo.2"
 BIN_PATH="/usr/local/bin/mihomo"
 CLI_PATH="/usr/local/bin/mh"
 CONFIG_DIR="/etc/mihomo"
@@ -4059,7 +4060,8 @@ menu() {
 ${C_CYAN}====================================================${C_RESET}
  [*] ${C_BOLD}Mihomo 一键配置管理面板${C_RESET}
 ${C_CYAN}====================================================${C_RESET}
-  >  ${C_BOLD}作者${C_RESET}：${C_PURPLE}${SCRIPT_AUTHOR}${C_RESET}
+  >  ${C_BOLD}原作者${C_RESET}：${C_PURPLE}${SCRIPT_AUTHOR}${C_RESET}
+  >  ${C_BOLD}Argo 优化${C_RESET}：${C_PURPLE}${SCRIPT_OPTIMIZER}${C_RESET}
   >  ${C_BOLD}版本${C_RESET}：${C_PURPLE}${SCRIPT_VERSION}${C_RESET}
   >  ${C_BOLD}状态${C_RESET}：${current_status}
 ${C_CYAN}----------------------------------------------------${C_RESET}

@@ -6,8 +6,12 @@
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 > 🚀 **专为 VPS 打造的极简 Mihomo 管理工具。**
-> 
+>
 > 安装后仅需在命令行输入 `mh`，即可唤出交互式管理面板。轻松实现内核安装、节点生成、订阅聚合与服务运维。
+
+**原作者：** [oKafuChino](https://github.com/oKafuChino)
+
+**Argo 集成与优化：** [TANYING](https://github.com/tanying-spec)
 
 ⚠️ **免责声明**：请务必在遵守当地法律法规、服务商条款（TOS）和网络使用政策的前提下使用本项目。
 
