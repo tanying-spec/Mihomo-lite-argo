@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.12.1（Argo 稳定版）
+# ✨ Mihomo Lite - 一键配置脚本 V1.12.2（Argo 稳定版）
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -47,6 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 * **🔐 下载校验**：优先验证上游 SHA-256 sidecar；上游未提供时继续执行格式、语法和可执行性检查。
 * **🧹 日志保护**：安装时配置日志轮转，单文件达到 10MiB 后轮转压缩并保留 3 份。
 * **🧯 压力恢复**：Tunnel 重启会修复服务模板、检查本地 Mihomo 源站并等待边缘连接恢复；菜单 `88` 提供 OOM、内存、进程和日志诊断。
+* **♻️ 自动恢复**：固定 Tunnel 安装后自动启用轻量健康守护；每分钟检查进程、本地 WS 源站和边缘连接，连续异常2次才修复，并设置5分钟冷却避免重启风暴。
 * **🔄 无缝升级**：支持一键更新 Mihomo、cloudflared 与管理脚本，菜单 `10` 提供版本回滚。
 * **🩺 健康检查**：菜单 `11` 或命令 `mh doctor` 检查配置、服务、数据库、监听端口、Tunnel 连接和 Token 权限。
 * **☁️ Argo Tunnel**：节点统一从菜单 `1` 创建；菜单 `88` 仅负责固定 Tunnel 的安装、更新、状态、检测、回滚和卸载。Token 使用 `--token-file` 读取。
@@ -64,6 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
 
 多线程测速会同时增加 WebSocket 连接数、文件描述符和内存缓冲。脚本为 cloudflared 设置 `262144` 文件描述符上限，并根据容器内存设置 Go 内存目标；低内存 LXC 仍建议使用菜单 `44` 的省资源稳连模式并控制测速线程数。如果节点突然不可用，可进入菜单 `88` 重启 Tunnel；该操作会先检查本地 Mihomo 源站，并在失败时联动恢复。菜单 `88` 的压力诊断可检查 cgroup OOM 计数和最近服务日志。
+
+Tunnel 自动恢复默认随固定隧道安装或手动重启启用，也可在菜单 `88` 中开关。进程退出时仍由 Systemd/OpenRC 立即拉起；健康守护用于处理“进程仍在但边缘连接为0”或“本地 Mihomo WS 源站失效”的半失效状态。恢复记录写入 `/var/log/mihomo/tunnel-watchdog.log`。
 
 > **重要：Argo 公共主机名不要提前创建 A/AAAA 记录。** 在 Tunnel 路由中保存公共主机名后，Cloudflare 会自动创建指向 `*.cfargotunnel.com` 的 CNAME。若已存在同名 A/AAAA，请先删除冲突记录。
 

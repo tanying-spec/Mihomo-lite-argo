@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.1-argo.6"
+SCRIPT_VERSION="1.12.2-argo.7"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -55,6 +55,10 @@ CLOUDFLARED_SERVICE="cloudflared-tunnel"
 CLOUDFLARED_LOG="/var/log/cloudflared-tunnel.log"
 CLOUDFLARED_METRICS="127.0.0.1:20241"
 CLOUDFLARED_METRICS_URL="http://127.0.0.1:20241/metrics"
+TUNNEL_WATCHDOG_CRON_MARK="mihomo-lite-tunnel-watchdog"
+TUNNEL_WATCHDOG_STATE="$CLOUDFLARED_CONFIG_DIR/watchdog.state"
+TUNNEL_WATCHDOG_LOCK="$CLOUDFLARED_CONFIG_DIR/watchdog.lock"
+TUNNEL_WATCHDOG_LOG="$LOG_DIR/tunnel-watchdog.log"
 LOGROTATE_FILE="/etc/logrotate.d/mihomo-lite"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -4630,6 +4634,7 @@ install_cloudflared() {
     return 1
   fi
   ui_success "Argo 固定隧道已安装并设为开机启动。"
+  enable_tunnel_watchdog || ui_warn "自动恢复未能启用，可稍后在 Tunnel 菜单手动启用。"
   ui_warn "下一步：Cloudflare Tunnel 后台添加公共主机名，服务填写 http://127.0.0.1:Mihomo的VLESS-WS端口。"
   ui_warn "客户端使用域名:443、TLS、相同 Host 和 WebSocket Path；无需映射该 WS 端口，也无需 DDNS。"
 }
@@ -4664,6 +4669,7 @@ EOF
     connection_wait=$((connection_wait + 1))
   done
   ui_success "Argo Tunnel 已重启，边缘连接：${cf_connections:-未知}。"
+  tunnel_watchdog_enabled || enable_tunnel_watchdog || true
   if [ -n "$argo_record" ]; then
     websocket_probe "http://127.0.0.1:$argo_port$argo_path" "$argo_host" || true
   fi
@@ -4699,6 +4705,134 @@ tunnel_diagnostics() {
       ;;
   esac
   ui_warn "若 oom/oom_kill 增长，说明多线程测速超过容器内存承载能力；优先使用菜单 44 的省资源稳连模式并降低测速线程数。"
+}
+
+tunnel_watchdog_cron_line() {
+  printf '* * * * * %s tunnel-watchdog >/dev/null 2>&1 # %s\n' "$CLI_PATH" "$TUNNEL_WATCHDOG_CRON_MARK"
+}
+
+tunnel_watchdog_enabled() {
+  command -v crontab >/dev/null 2>&1 || return 1
+  crontab -l 2>/dev/null | grep -q "$TUNNEL_WATCHDOG_CRON_MARK"
+}
+
+tunnel_local_origin_healthy() {
+  watchdog_record="$(awk -F'|' '$1 == "vless-ws" && $7 == "argo" { print; exit }' "$NODES_DB" 2>/dev/null)"
+  [ -n "$watchdog_record" ] || return 0
+  IFS='|' read -r _ _ watchdog_port _ watchdog_path watchdog_host _ _ _ <<EOF
+$watchdog_record
+EOF
+  watchdog_status="$(curl --http1.1 -sS -i -N --max-time 4 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    -H "Host: $watchdog_host" "http://127.0.0.1:$watchdog_port$watchdog_path" 2>/dev/null | sed -n '1{s/\r$//;p;}' || true)"
+  case "$watchdog_status" in *' 101 '*) return 0 ;; *) return 1 ;; esac
+}
+
+run_tunnel_watchdog() {
+  [ -x "$CLOUDFLARED_BIN" ] && [ -s "$CLOUDFLARED_TOKEN_FILE" ] || return 0
+  mkdir -p "$CLOUDFLARED_CONFIG_DIR" "$LOG_DIR"
+  if [ -d "$TUNNEL_WATCHDOG_LOCK" ]; then
+    watchdog_lock_pid="$(cat "$TUNNEL_WATCHDOG_LOCK/pid" 2>/dev/null || true)"
+    case "$watchdog_lock_pid" in
+      ''|*[!0-9]*) rm -rf "$TUNNEL_WATCHDOG_LOCK" ;;
+      *) kill -0 "$watchdog_lock_pid" 2>/dev/null || rm -rf "$TUNNEL_WATCHDOG_LOCK" ;;
+    esac
+  fi
+  mkdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || return 0
+  printf '%s\n' "$$" > "$TUNNEL_WATCHDOG_LOCK/pid"
+  trap 'rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true' 0 HUP INT TERM
+
+  watchdog_failures=0
+  watchdog_last_restart=0
+  if [ -r "$TUNNEL_WATCHDOG_STATE" ]; then
+    IFS='|' read -r watchdog_failures watchdog_last_restart < "$TUNNEL_WATCHDOG_STATE" || true
+  fi
+  case "$watchdog_failures" in ''|*[!0-9]*) watchdog_failures=0 ;; esac
+  case "$watchdog_last_restart" in ''|*[!0-9]*) watchdog_last_restart=0 ;; esac
+
+  watchdog_connections="$(cloudflared_connection_count)"
+  watchdog_process_ok=0
+  watchdog_origin_ok=0
+  cloudflared_service_is_running && watchdog_process_ok=1
+  tunnel_local_origin_healthy && watchdog_origin_ok=1
+  case "$watchdog_connections" in ''|0|'未知'*|'不可用') watchdog_edge_ok=0 ;; *) watchdog_edge_ok=1 ;; esac
+
+  if [ "$watchdog_process_ok" = "1" ] && [ "$watchdog_origin_ok" = "1" ] && [ "$watchdog_edge_ok" = "1" ]; then
+    printf '0|%s\n' "$watchdog_last_restart" > "$TUNNEL_WATCHDOG_STATE"
+    chmod 600 "$TUNNEL_WATCHDOG_STATE"
+    rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+    trap - 0 HUP INT TERM
+    return 0
+  fi
+
+  watchdog_failures=$((watchdog_failures + 1))
+  watchdog_now="$(date +%s 2>/dev/null || printf '0')"
+  printf '%s|%s\n' "$watchdog_failures" "$watchdog_last_restart" > "$TUNNEL_WATCHDOG_STATE"
+  chmod 600 "$TUNNEL_WATCHDOG_STATE"
+
+  if [ "$watchdog_process_ok" = "1" ] && [ "$watchdog_failures" -lt 2 ]; then
+    rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+    trap - 0 HUP INT TERM
+    return 0
+  fi
+  if [ "$watchdog_now" -gt 0 ] && [ $((watchdog_now - watchdog_last_restart)) -lt 300 ]; then
+    rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+    trap - 0 HUP INT TERM
+    return 0
+  fi
+
+  printf '%s watchdog recovery: process=%s origin=%s edge=%s failures=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf unknown)" \
+    "$watchdog_process_ok" "$watchdog_origin_ok" "$watchdog_edge_ok" "$watchdog_failures" >> "$TUNNEL_WATCHDOG_LOG"
+  if [ "$watchdog_origin_ok" != "1" ]; then
+    restart_service >> "$TUNNEL_WATCHDOG_LOG" 2>&1 || true
+  fi
+  restart_cloudflared_service >> "$TUNNEL_WATCHDOG_LOG" 2>&1 || true
+  printf '0|%s\n' "$watchdog_now" > "$TUNNEL_WATCHDOG_STATE"
+  chmod 600 "$TUNNEL_WATCHDOG_STATE"
+  rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+  trap - 0 HUP INT TERM
+}
+
+enable_tunnel_watchdog() {
+  ensure_cron_service || return 1
+  tmp_file="$(make_temp /tmp/mh-tunnel-cron.XXXXXX)"
+  crontab -l 2>/dev/null | grep -v "$TUNNEL_WATCHDOG_CRON_MARK" > "$tmp_file" || true
+  tunnel_watchdog_cron_line >> "$tmp_file"
+  if ! crontab "$tmp_file"; then
+    rm -f "$tmp_file"
+    ui_error "自动恢复任务写入失败。"
+    return 1
+  fi
+  rm -f "$tmp_file"
+  ui_success "Tunnel 自动恢复已启用：每分钟检查，连续异常2次才修复，重启冷却5分钟。"
+}
+
+disable_tunnel_watchdog() {
+  if command -v crontab >/dev/null 2>&1; then
+    tmp_file="$(make_temp /tmp/mh-tunnel-cron.XXXXXX)"
+    crontab -l 2>/dev/null | grep -v "$TUNNEL_WATCHDOG_CRON_MARK" > "$tmp_file" || true
+    crontab "$tmp_file" >/dev/null 2>&1 || true
+    rm -f "$tmp_file"
+  fi
+  rm -f "$TUNNEL_WATCHDOG_STATE"
+  rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+  ui_success "Tunnel 自动恢复已关闭。"
+}
+
+tunnel_watchdog_menu() {
+  if tunnel_watchdog_enabled; then
+    ui_warn "Tunnel 自动恢复当前已启用。"
+    ui_prompt "是否关闭？[y/N]："
+    read -r watchdog_choice || true
+    case "$watchdog_choice" in y|Y|yes|YES) disable_tunnel_watchdog ;; *) return 0 ;; esac
+  else
+    ui_warn "Tunnel 自动恢复当前未启用。"
+    ui_prompt "是否启用？[Y/n]："
+    read -r watchdog_choice || true
+    case "$watchdog_choice" in n|N|no|NO) return 0 ;; *) enable_tunnel_watchdog ;; esac
+  fi
 }
 
 rollback_cloudflared() {
@@ -4739,6 +4873,7 @@ uninstall_cloudflared() {
 }
 
 remove_cloudflared_files() {
+  disable_tunnel_watchdog >/dev/null 2>&1 || true
   manager="$(service_manager)"
   case "$manager" in
     systemd)
@@ -4851,7 +4986,8 @@ cloudflared_menu() {
     cf_status="$(cloudflared_status_text)"
     cf_version="$(cloudflared_version_text)"
     cf_connections="$(cloudflared_connection_count)"
-    printf ' 当前状态：%s | 版本：%s | 活跃连接：%s\n' "$cf_status" "$cf_version" "$cf_connections"
+    tunnel_watchdog_enabled && watchdog_status="已启用" || watchdog_status="未启用"
+    printf ' 当前状态：%s | 版本：%s | 活跃连接：%s | 自动恢复：%s\n' "$cf_status" "$cf_version" "$cf_connections" "$watchdog_status"
     ui_dash
     printf ' %s1.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
     printf ' %s2.%s 查看 Argo 节点、路由信息和链接\n' "$C_GREEN" "$C_RESET"
@@ -4861,10 +4997,11 @@ cloudflared_menu() {
     printf ' %s6.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
     printf ' %s7.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
     printf ' %s8.%s 压力 / OOM / 服务故障诊断\n' "$C_GREEN" "$C_RESET"
-    printf ' %s9.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s9.%s 开启 / 关闭 Tunnel 自动恢复\n' "$C_GREEN" "$C_RESET"
+    printf ' %s10.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
     printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
     ui_dash
-    ui_prompt "请输入数字选择 (0-9)："
+    ui_prompt "请输入数字选择 (0-10)："
     read -r cf_choice || return 0
     case "$cf_choice" in
       1) install_cloudflared; pause ;;
@@ -4875,7 +5012,8 @@ cloudflared_menu() {
       6) show_cloudflared_logs ;;
       7) rollback_cloudflared; pause ;;
       8) tunnel_diagnostics; pause ;;
-      9) uninstall_cloudflared; pause ;;
+      9) tunnel_watchdog_menu; pause ;;
+      10) uninstall_cloudflared; pause ;;
       0) return 0 ;;
       *) ui_error "无效选择。"; pause ;;
     esac
@@ -5217,6 +5355,9 @@ case "${1:-}" in
   sysctl|netopt|55) optimize_sysctl_network ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   argo|tunnel|cloudflared|88) cloudflared_menu ;;
+  tunnel-watchdog) run_tunnel_watchdog ;;
+  tunnel-watchdog-on) need_root; enable_tunnel_watchdog ;;
+  tunnel-watchdog-off) need_root; disable_tunnel_watchdog ;;
   traffic|usage) need_root; ensure_installed; update_user_traffic_from_connections ;;
   traffic-auto) run_traffic_auto_refresh ;;
   traffic-cron|auto-traffic|traffic-auto-menu) need_root; ensure_installed; traffic_auto_refresh_menu ;;
