@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.11.0-argo.4"
+SCRIPT_VERSION="1.12.0-argo.5"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -55,6 +55,7 @@ CLOUDFLARED_SERVICE="cloudflared-tunnel"
 CLOUDFLARED_LOG="/var/log/cloudflared-tunnel.log"
 CLOUDFLARED_METRICS="127.0.0.1:20241"
 CLOUDFLARED_METRICS_URL="http://127.0.0.1:20241/metrics"
+LOGROTATE_FILE="/etc/logrotate.d/mihomo-lite"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 
@@ -185,6 +186,38 @@ ensure_curl() {
   command -v curl >/dev/null 2>&1 || install_packages curl
 }
 
+sha256_file() {
+  checksum_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$checksum_file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$checksum_file" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
+verify_remote_checksum() {
+  checksum_url="$1"
+  checksum_target="$2"
+  checksum_tmp="$(make_temp /tmp/mh-checksum.XXXXXX)"
+  if ! curl -fsSL --max-time 15 "${checksum_url}.sha256" -o "$checksum_tmp"; then
+    rm -f "$checksum_tmp"
+    ui_warn "上游未提供 SHA-256 sidecar，继续使用格式与可执行性检查。"
+    return 2
+  fi
+  expected_checksum="$(awk 'NR == 1 { print $1 }' "$checksum_tmp" | tr 'A-F' 'a-f')"
+  actual_checksum="$(sha256_file "$checksum_target" 2>/dev/null | tr 'A-F' 'a-f' || true)"
+  rm -f "$checksum_tmp"
+  case "$expected_checksum" in ''|*[!0-9a-f]* ) ui_error "远程 SHA-256 文件格式无效。"; return 1 ;; esac
+  [ "${#expected_checksum}" -eq 64 ] || { ui_error "远程 SHA-256 长度无效。"; return 1; }
+  if [ "$expected_checksum" != "$actual_checksum" ]; then
+    ui_error "SHA-256 校验失败，拒绝安装下载内容。"
+    return 1
+  fi
+  ui_success "SHA-256 校验通过。"
+}
+
 ensure_cron_service() {
   manager="$(service_manager)"
   if command -v crontab >/dev/null 2>&1; then
@@ -218,6 +251,21 @@ ensure_cron_service() {
     ui_error "crontab 仍不可用，无法启用自动刷新。"
     return 1
   }
+}
+
+write_logrotate_config() {
+  [ -d /etc/logrotate.d ] || return 0
+  cat > "$LOGROTATE_FILE" <<EOF
+$LOG_DIR/*.log $LOG_DIR/*.err $CLOUDFLARED_LOG {
+  size 10M
+  rotate 3
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+  chmod 644 "$LOGROTATE_FILE"
 }
 
 make_temp() {
@@ -1682,11 +1730,13 @@ install_core() {
   need_root
   screen_title "一键安装 Mihomo 内核"
   detect_os
+  check_internal_ports mihomo || return 1
   prompt_runtime_tuning
   prompt_multi_user_feature
   ui_section "安装系统依赖"
-  install_packages curl gzip openssl
+  install_packages curl gzip openssl logrotate
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+  write_logrotate_config
 
   download_url="$(latest_download_url)"
   tmp_file="$(make_temp /tmp/mihomo.XXXXXX)"
@@ -1696,11 +1746,16 @@ install_core() {
   ui_section "下载并安装 Mihomo 内核"
   curl -fL "$download_url" -o "$tmp_file" || {
     rm -f "$tmp_file" "$bin_tmp"
-    exit 1
+    ui_error "Mihomo 下载失败。"
+    return 1
   }
+  verify_remote_checksum "$download_url" "$tmp_file"
+  verify_result=$?
+  [ "$verify_result" -ne 1 ] || { rm -f "$tmp_file" "$bin_tmp"; return 1; }
   gzip -dc "$tmp_file" > "$bin_tmp" || {
     rm -f "$tmp_file" "$bin_tmp"
-    exit 1
+    ui_error "下载文件无法解压。"
+    return 1
   }
   chmod +x "$bin_tmp"
   if ! "$bin_tmp" -v >/dev/null 2>&1; then
@@ -1832,6 +1887,37 @@ system_port_in_use() {
   return 1
 }
 
+port_owned_by_process() {
+  owned_port="$1"
+  owned_process="$2"
+  command -v ss >/dev/null 2>&1 || return 2
+  ss -lntup 2>/dev/null | awk -v p="$owned_port" -v proc="$owned_process" '
+    {
+      address = $5
+      sub(/^.*:/, "", address)
+      if (address == p && index($0, proc) > 0) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+port_bound_to_loopback() {
+  loop_port="$1"
+  command -v ss >/dev/null 2>&1 || return 2
+  ss -lntu 2>/dev/null | awk -v p="$loop_port" '
+    {
+      address = $5
+      raw = address
+      sub(/^.*:/, "", address)
+      if (address == p) {
+        found = 1
+        if (raw !~ /^127\.0\.0\.1:/ && raw !~ /^\[::1\]:/) public_bind = 1
+      }
+    }
+    END { if (!found) exit 2; exit public_bind ? 1 : 0 }
+  '
+}
+
 port_in_use() {
   port="$1"
   if awk -F'|' -v p="$port" '
@@ -1851,6 +1937,29 @@ port_in_use() {
   fi
 
   system_port_in_use "$port"
+}
+
+check_internal_ports() {
+  check_scope="${1:-all}"
+  if [ "$check_scope" != "cloudflared" ]; then
+  for reserved_port in 7890 9090 1053; do
+    if system_port_in_use "$reserved_port"; then
+      if command -v ss >/dev/null 2>&1 && port_owned_by_process "$reserved_port" "mihomo"; then
+        continue
+      fi
+      ui_error "Mihomo 内部端口 $reserved_port 已被其他进程占用。"
+      return 1
+    fi
+  done
+  fi
+  [ "$check_scope" != "mihomo" ] || return 0
+  if system_port_in_use 20241; then
+    if command -v ss >/dev/null 2>&1 && port_owned_by_process 20241 "cloudflared"; then
+      return 0
+    fi
+    ui_error "cloudflared 内部监控端口 20241 已被其他进程占用。"
+    return 1
+  fi
 }
 
 remove_users_for_node() {
@@ -2153,7 +2262,7 @@ state_transaction_begin() {
     return 1
   }
   printf '%s\n' "$STATE_TX_DIR" > "$STATE_LOCK_DIR/txdir"
-  for state_file in nodes.db users.db traffic.db; do
+  for state_file in nodes.db users.db traffic.db runtime.env network.env features.env multi-user.enabled; do
     if [ -e "$CONFIG_DIR/$state_file" ]; then
       cp "$CONFIG_DIR/$state_file" "$STATE_TX_DIR/$state_file"
     else
@@ -2173,13 +2282,13 @@ state_transaction_commit() {
 state_transaction_abort() {
   state_transaction_restore_files
   state_transaction_commit
-  ui_error "操作被中断，数据库已恢复。"
+  ui_error "操作被中断，节点、用户和运行设置已恢复。"
   exit 130
 }
 
 state_transaction_restore_files() {
   [ -n "${STATE_TX_DIR:-}" ] && [ -d "$STATE_TX_DIR" ] || return 0
-  for state_file in nodes.db users.db traffic.db; do
+  for state_file in nodes.db users.db traffic.db runtime.env network.env features.env multi-user.enabled; do
     if [ -f "$STATE_TX_DIR/$state_file" ]; then
       cp "$STATE_TX_DIR/$state_file" "$CONFIG_DIR/$state_file"
       chmod 600 "$CONFIG_DIR/$state_file"
@@ -2194,7 +2303,7 @@ state_transaction_apply() {
     state_transaction_commit
     return 0
   fi
-  ui_error "状态变更未能安全生效，正在恢复节点和用户数据库。"
+  ui_error "状态变更未能安全生效，正在恢复节点、用户和运行设置。"
   state_transaction_restore_files
   render_config >/dev/null 2>&1 || true
   restart_service >/dev/null 2>&1 || true
@@ -2370,10 +2479,18 @@ print_node_link() {
     return 1
   fi
   node_link="$(node_share_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6")"
+  link_notice="请确认 VPS 防火墙和云厂商安全组已放行 TCP/UDP $node_port"
+  if [ "$proto" = "vless-ws" ]; then
+    case "$value4" in
+      argo) link_notice="Argo 本地监听 127.0.0.1:$node_port，无需开放或映射该端口" ;;
+      direct) link_notice="请确认公网 TCP ${value6:-$node_port} 已映射到本地 $node_port" ;;
+      cdn) link_notice="请确认源站端口 $node_port 可达，客户端 Cloudflare 入口为 ${value6:-443}" ;;
+    esac
+  fi
   cat <<EOF
 
 ${C_CYAN}----------------------------------------------------${C_RESET}
- ${C_YELLOW}[!]${C_RESET} 请确认 VPS 防火墙和云厂商安全组已放行 TCP/UDP ${C_BOLD}$node_port${C_RESET}
+ ${C_YELLOW}[!]${C_RESET} $link_notice
 
  ${C_GREEN}[+] 节点链接${C_RESET}
 $node_link
@@ -2394,7 +2511,7 @@ add_vless_reality_node() {
   [ -n "$sni" ] || sni="www.amd.com"
   dest="${sni}:443"
   node_uuid="$(new_uuid)"
-  key_pair="$(create_reality_keypair)" || exit 1
+  key_pair="$(create_reality_keypair)" || { ui_error "Reality 密钥生成失败。"; return 1; }
   private_key="${key_pair%%|*}"
   public_key="${key_pair#*|}"
   short_id="$(rand_hex 8)"
@@ -2428,7 +2545,7 @@ add_hysteria2_node() {
       salamander_password="$(rand_alnum 32)"
       ;;
   esac
-  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
+  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || { ui_error "Hysteria2 证书生成失败。"; return 1; }
   cert_file="${cert_pair%%|*}"
   key_file="${cert_pair#*|}"
   append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file|$salamander_password|"
@@ -2448,7 +2565,7 @@ add_anytls_node() {
   sni="$(sanitize_sni_field "$sni")"
   [ -n "$sni" ] || sni="www.amd.com"
   node_password="$(rand_alnum 32)"
-  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || exit 1
+  cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || { ui_error "AnyTLS 证书生成失败。"; return 1; }
   cert_file="${cert_pair%%|*}"
   key_file="${cert_pair#*|}"
   append_node "anytls|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||"
@@ -2568,7 +2685,7 @@ add_combo_nodes() {
   reality_name="$(unique_node_name vless-reality)"
   reality_port="$(unique_port)"
   reality_uuid="$(new_uuid)"
-  reality_key_pair="$(create_reality_keypair)" || exit 1
+  reality_key_pair="$(create_reality_keypair)" || { ui_error "Reality 密钥生成失败。"; return 1; }
   reality_private_key="${reality_key_pair%%|*}"
   reality_public_key="${reality_key_pair#*|}"
   reality_short_id="$(rand_hex 8)"
@@ -2577,14 +2694,14 @@ add_combo_nodes() {
   hy2_name="$(unique_node_name hy2)"
   hy2_port="$(unique_port)"
   hy2_password="$(rand_alnum 32)"
-  hy2_cert_pair="$(ensure_tls_cert "$hy2_name" "$sni")" || exit 1
+  hy2_cert_pair="$(ensure_tls_cert "$hy2_name" "$sni")" || { ui_error "Hysteria2 证书生成失败。"; return 1; }
   hy2_cert_file="${hy2_cert_pair%%|*}"
   hy2_key_file="${hy2_cert_pair#*|}"
 
   anytls_name="$(unique_node_name anytls)"
   anytls_port="$(unique_port)"
   anytls_password="$(rand_alnum 32)"
-  anytls_cert_pair="$(ensure_tls_cert "$anytls_name" "$sni")" || exit 1
+  anytls_cert_pair="$(ensure_tls_cert "$anytls_name" "$sni")" || { ui_error "AnyTLS 证书生成失败。"; return 1; }
   anytls_cert_file="${anytls_cert_pair%%|*}"
   anytls_key_file="${anytls_cert_pair#*|}"
 
@@ -2617,7 +2734,7 @@ rename_all_nodes() {
   country_input="$(sanitize_label "$country_input")"
   if [ -z "$country_input" ]; then
     ui_error "国家/地区不能为空。"
-    exit 1
+    return 1
   fi
 
   country_info="$(country_profile "$country_input" || true)"
@@ -2630,7 +2747,7 @@ rename_all_nodes() {
     country_name="$country_input"
     if [ -z "$country_emoji" ]; then
       ui_error "国家旗帜 Emoji 不能为空。"
-      exit 1
+      return 1
     fi
   fi
 
@@ -2639,7 +2756,7 @@ rename_all_nodes() {
   provider="$(sanitize_label "$provider")"
   if [ -z "$provider" ]; then
     ui_error "服务商名称不能为空。"
-    exit 1
+    return 1
   fi
 
   tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
@@ -2792,6 +2909,155 @@ list_nodes() {
   done < "$NODES_DB"
 }
 
+select_node() {
+  list_nodes || return 1
+  ui_prompt "请输入节点编号（0 返回）："
+  read -r selected_node_choice || true
+  case "$selected_node_choice" in
+    0) return 1 ;;
+    ''|*[!0-9]*) ui_error "请输入有效数字。"; return 1 ;;
+  esac
+  SELECTED_NODE_RECORD="$(node_record_by_index "$selected_node_choice")"
+  [ -n "$SELECTED_NODE_RECORD" ] || { ui_error "未找到编号 $selected_node_choice。"; return 1; }
+  SELECTED_NODE_INDEX="$selected_node_choice"
+}
+
+replace_selected_node_record() {
+  replacement_record="$1"
+  state_transaction_begin || return 1
+  tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
+  awk -F'|' -v n="$SELECTED_NODE_INDEX" -v replacement="$replacement_record" '
+    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+      i++
+      if (i == n) { print replacement; next }
+    }
+    { print }
+  ' "$NODES_DB" > "$tmp_file"
+  mv "$tmp_file" "$NODES_DB"
+  chmod 600 "$NODES_DB"
+  if [ -n "${EDIT_OLD_NODE_NAME:-}" ] && [ -n "${EDIT_NEW_NODE_NAME:-}" ] && [ "$EDIT_OLD_NODE_NAME" != "$EDIT_NEW_NODE_NAME" ] && [ -s "$USERS_DB" ]; then
+    tmp_file="$(make_temp "$CONFIG_DIR/users.XXXXXX")"
+    awk -F'|' -v old="$EDIT_OLD_NODE_NAME" -v new="$EDIT_NEW_NODE_NAME" '
+      BEGIN { OFS = FS }
+      $2 == old { $2 = new }
+      { print }
+    ' "$USERS_DB" > "$tmp_file"
+    mv "$tmp_file" "$USERS_DB"
+    chmod 600 "$USERS_DB"
+  fi
+  state_transaction_apply
+}
+
+edit_node() {
+  need_root
+  ensure_installed
+  screen_title "编辑节点"
+  select_node || return 0
+  IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6 <<EOF
+$SELECTED_NODE_RECORD
+EOF
+  EDIT_OLD_NODE_NAME="$node_name"
+  ui_section "$node_name ($proto)"
+  printf ' %s1.%s 修改名称\n' "$C_GREEN" "$C_RESET"
+  printf ' %s2.%s 修改本地监听端口\n' "$C_GREEN" "$C_RESET"
+  printf ' %s3.%s 重新生成凭据（UUID/密码）\n' "$C_GREEN" "$C_RESET"
+  [ "$proto" = "vless-ws" ] && printf ' %s4.%s 修改 WebSocket 模式、Host、Path 和入口\n' "$C_GREEN" "$C_RESET"
+  printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
+  ui_prompt "请选择编辑项目："
+  read -r edit_choice || true
+
+  case "$edit_choice" in
+    1)
+      ui_prompt "请输入新名称："
+      read -r new_name || true
+      new_name="$(printf '%s' "$new_name" | tr -cd 'A-Za-z0-9_.-')"
+      [ -n "$new_name" ] || { ui_error "名称无效。"; return 1; }
+      if [ "$new_name" != "$node_name" ] && node_name_exists "$new_name"; then
+        ui_error "节点 $new_name 已存在。"
+        return 1
+      fi
+      node_name="$new_name"
+      ;;
+    2)
+      prompt_port || return 1
+      node_port="$SELECTED_NODE_PORT"
+      ;;
+    3)
+      case "$proto" in
+        vless-reality|vless-ws) value1="$(new_uuid)" ;;
+        hysteria2|anytls) value1="$(rand_alnum 32)" ;;
+      esac
+      ;;
+    4)
+      [ "$proto" = "vless-ws" ] || { ui_error "此节点不是 VLESS-WS。"; return 1; }
+      cat <<EOF
+ 1. IP 直连 WS
+ 2. Cloudflare CDN WS-TLS
+ 3. Cloudflare Tunnel / Argo WS-TLS
+EOF
+      ui_prompt "请选择 WS 模式："
+      read -r ws_edit_mode || true
+      case "$ws_edit_mode" in
+        1)
+          value3=""; value4="direct"; value5=""
+          ui_prompt "请输入公网映射端口（默认 $node_port）："
+          read -r value6 || true
+          [ -n "$value6" ] || value6="$node_port"
+          case "$value6" in ''|*[!0-9]*) ui_error "公网映射端口必须是数字。"; return 1 ;; esac
+          if [ "$value6" -lt 1 ] || [ "$value6" -gt 65535 ]; then
+            ui_error "公网映射端口范围必须为 1-65535。"
+            return 1
+          fi
+          ;;
+        2|3)
+          [ "$ws_edit_mode" = "2" ] && value4="cdn" || value4="argo"
+          [ "$value4" = "argo" ] && ui_warn "不要预建同名 A/AAAA；由 Tunnel 路由创建 CNAME。"
+          ui_prompt "请输入完整 Host/SNI 域名："
+          read -r value3 || true
+          value3="$(sanitize_sni_field "$value3")"
+          is_valid_hostname "$value3" || { ui_error "Host/SNI 域名无效。"; return 1; }
+          ui_prompt "请输入客户端入口（默认 $value3，可填 CF 优选 IP/域名）："
+          read -r value5 || true
+          [ -n "$value5" ] || value5="$value3"
+          value5="$(sanitize_db_field "$value5" | tr -d '[:space:]')"
+          is_valid_endpoint "$value5" || { ui_error "客户端入口无效。"; return 1; }
+          value6="443"
+          ;;
+        *) ui_error "无效选择。"; return 1 ;;
+      esac
+      ui_prompt "请输入 WebSocket Path（默认 $value2）："
+      read -r new_path || true
+      [ -n "$new_path" ] && value2="$(sanitize_db_field "$new_path")"
+      [ -n "$value2" ] || value2="/$(rand_alnum 10)"
+      case "$value2" in /*) ;; *) value2="/$value2" ;; esac
+      ;;
+    0) return 0 ;;
+    *) ui_error "无效选择。"; return 1 ;;
+  esac
+
+  EDIT_NEW_NODE_NAME="$node_name"
+  replace_selected_node_record "$proto|$node_name|$node_port|$value1|$value2|$value3|$value4|$value5|$value6" || return 1
+  EDIT_OLD_NODE_NAME=""
+  EDIT_NEW_NODE_NAME=""
+  ui_success "节点已更新并通过配置检查。"
+  print_node_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6"
+}
+
+node_management_menu() {
+  screen_title "节点管理"
+  printf ' %s1.%s 编辑节点\n' "$C_GREEN" "$C_RESET"
+  printf ' %s2.%s 删除节点\n' "$C_GREEN" "$C_RESET"
+  printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
+  ui_prompt "请输入数字选择 (0-2)："
+  read -r node_manage_choice || true
+  case "$node_manage_choice" in
+    1) edit_node ;;
+    2) delete_node ;;
+    0) return 0 ;;
+    *) ui_error "无效选择。"; return 1 ;;
+  esac
+}
+
 delete_node() {
   need_root
   ensure_installed
@@ -2808,7 +3074,7 @@ delete_node() {
   case "$choice" in
     ''|*[!0-9]*)
       ui_error "请输入有效数字。"
-      exit 1
+      return 1
       ;;
   esac
 
@@ -2849,7 +3115,7 @@ delete_node() {
   ' "$NODES_DB")"
   if [ -z "$deleted" ]; then
     ui_error "未找到编号 $choice。"
-    exit 1
+    return 1
   fi
 
   ui_prompt "确认删除节点 $deleted？输入 y 确认："
@@ -3707,7 +3973,7 @@ show_logs() {
       ;;
     *)
       red "未找到 systemd 或 OpenRC，无法查看服务日志。"
-      exit 1
+      return 1
       ;;
   esac
 }
@@ -3723,7 +3989,7 @@ apply_runtime_service() {
       ;;
     *)
       red "未找到 systemd 或 OpenRC，无法应用性能参数。"
-      exit 1
+      return 1
       ;;
   esac
 }
@@ -4175,7 +4441,7 @@ cloudflared_version_text() {
 cloudflared_connection_count() {
   command -v curl >/dev/null 2>&1 || { printf '不可用'; return; }
   metrics_data="$(curl -fsS --max-time 2 "$CLOUDFLARED_METRICS_URL" 2>/dev/null || true)"
-  [ -n "$metrics_data" ] || { printf '0'; return; }
+  [ -n "$metrics_data" ] || { printf '未知（本地监控不可用）'; return; }
   printf '%s\n' "$metrics_data" | awk '
     /^cloudflared_tunnel_ha_connections([{ ]|$)/ { total += $NF; found = 1 }
     END { if (found) printf "%d", total; else printf "0" }
@@ -4277,6 +4543,7 @@ EOF
 install_cloudflared() {
   need_root
   detect_os
+  check_internal_ports cloudflared || return 1
   ensure_curl
   cf_arch="$(cloudflared_arch)" || {
     ui_error "暂不支持当前 CPU 架构：$(uname -m)。"
@@ -4307,6 +4574,9 @@ install_cloudflared() {
     ui_error "cloudflared 下载失败。"
     return 1
   fi
+  verify_remote_checksum "$cf_url" "$tmp_file"
+  verify_result=$?
+  [ "$verify_result" -ne 1 ] || { rm -f "$tmp_file"; return 1; }
   chmod 755 "$tmp_file"
   if ! "$tmp_file" --version >/dev/null 2>&1; then
     rm -f "$tmp_file"
@@ -4424,89 +4694,6 @@ select_vless_ws_node() {
   SELECTED_WS_INDEX="$ws_choice"
 }
 
-create_argo_node() {
-  need_root
-  ensure_installed
-  screen_title "一键创建 Argo VLESS-WS 节点"
-  ui_warn "不要提前创建同名 A/AAAA；Tunnel 路由保存后应由 Cloudflare 自动创建 CNAME。"
-  ui_prompt "请输入 Tunnel 公共主机名（例如 argo.example.com）："
-  read -r ws_host || true
-  ws_host="$(sanitize_sni_field "$ws_host")"
-  is_valid_hostname "$ws_host" || { ui_error "请输入有效的完整公共主机名。"; return 1; }
-
-  ws_default_name="$(unique_node_name argo-vless-ws)"
-  prompt_node_name argo-vless-ws "$ws_default_name" || return 1
-  node_name="$SELECTED_NODE_NAME"
-  node_port="$(unique_port)"
-  node_uuid="$(new_uuid)"
-  ws_path="/$(rand_alnum 16)"
-
-  ui_prompt "请输入客户端入口地址（默认 $ws_host，可填写优选域名/IP）："
-  read -r ws_entry_address || true
-  [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
-  ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
-  is_valid_endpoint "$ws_entry_address" || { ui_error "客户端入口必须是有效域名或 IP。"; return 1; }
-
-  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path|$ws_host|argo|$ws_entry_address|443" || return 1
-  ui_success "Argo 专用节点已创建，并仅监听 127.0.0.1:$node_port。"
-  printf ' 公共主机名：%s\n 服务地址：http://127.0.0.1:%s\n WebSocket Path：%s\n' "$ws_host" "$node_port" "$ws_path"
-  ui_warn "请在 Cloudflare Tunnel 后台添加以上公共主机名和服务地址。"
-  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "argo" "$ws_entry_address" "443"
-
-  if [ "$(cloudflared_status_text)" = "运行中" ]; then
-    websocket_probe "http://127.0.0.1:$node_port$ws_path" "$ws_host" || true
-  else
-    ui_warn "cloudflared 尚未运行；可返回菜单选择安装/更新 Tunnel Token。"
-  fi
-}
-
-configure_argo_node() {
-  need_root
-  ensure_installed
-  screen_title "配置 Argo 专用 VLESS-WS 节点"
-  select_vless_ws_node || return 0
-  IFS='|' read -r proto node_name node_port node_uuid ws_path old_host old_mode old_entry old_entry_port <<EOF
-$SELECTED_WS_RECORD
-EOF
-
-  ui_warn "不要提前创建同名 A/AAAA 记录。请在 Tunnel 路由中添加公共主机名，由 Cloudflare 自动创建 CNAME。"
-  ui_prompt "请输入 Tunnel 公共主机名${old_host:+（默认 $old_host）}："
-  read -r ws_host || true
-  [ -n "$ws_host" ] || ws_host="$old_host"
-  ws_host="$(sanitize_sni_field "$ws_host")"
-  is_valid_hostname "$ws_host" || { ui_error "请输入有效的完整公共主机名。"; return 1; }
-  ui_prompt "请输入客户端入口地址（默认 $ws_host，可填写优选域名/IP）："
-  read -r ws_entry_address || true
-  [ -n "$ws_entry_address" ] || ws_entry_address="$ws_host"
-  ws_entry_address="$(sanitize_db_field "$ws_entry_address" | tr -d '[:space:]')"
-  is_valid_endpoint "$ws_entry_address" || { ui_error "客户端入口必须是有效域名或 IP。"; return 1; }
-
-  state_transaction_begin || return 1
-  tmp_file="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
-  awk -F'|' -v n="$SELECTED_WS_INDEX" -v host="$ws_host" -v entry="$ws_entry_address" '
-    BEGIN { OFS = FS }
-    $1 == "vless-ws" {
-      i++
-      if (i == n) {
-        $6 = host
-        $7 = "argo"
-        $8 = entry
-        $9 = "443"
-      }
-    }
-    { print }
-  ' "$NODES_DB" > "$tmp_file"
-  mv "$tmp_file" "$NODES_DB"
-  chmod 600 "$NODES_DB"
-  state_transaction_apply || return 1
-
-  ui_success "节点 $node_name 已切换为 Argo 模式，并仅监听 127.0.0.1:$node_port。"
-  ui_warn "Cloudflare Tunnel 路由填写："
-  printf ' 公共主机名：%s\n 服务地址：http://127.0.0.1:%s\n WebSocket Path：%s\n' "$ws_host" "$node_port" "$ws_path"
-  ui_warn "不要手动创建 A/AAAA；保存 Tunnel 路由后应自动出现指向 *.cfargotunnel.com 的 CNAME。"
-  print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "argo" "$ws_entry_address" "443"
-}
-
 show_argo_nodes() {
   ensure_installed
   screen_title "查看 Argo 节点与路由信息"
@@ -4522,7 +4709,7 @@ show_argo_nodes() {
     printf ' 公共主机名：%s\n 本地服务：http://127.0.0.1:%s\n WebSocket Path：%s\n 节点链接：%s\n\n' \
       "$value3" "$node_port" "$value2" "$node_link"
   done < "$NODES_DB"
-  [ "$found" -gt 0 ] || ui_warn "当前没有 Argo 模式的 VLESS-WS 节点，请先选择菜单 2 配置。"
+  [ "$found" -gt 0 ] || ui_warn "当前没有 Argo 节点，请从主菜单 1 创建 VLESS-WS 并选择 Argo 模式。"
 }
 
 websocket_probe() {
@@ -4541,8 +4728,12 @@ websocket_probe() {
   rm -f "$probe_file"
   case "$probe_status" in
     *' 101 '*) ui_success "WebSocket 握手成功：$probe_status"; return 0 ;;
-    '') ui_error "未收到响应：$probe_url"; return 1 ;;
-    *) ui_error "WebSocket 握手失败：$probe_status"; return 1 ;;
+    *' 400 '*) ui_error "HTTP 400：Host、Path 或 WebSocket Upgrade 参数不匹配。"; return 1 ;;
+    *' 404 '*) ui_error "HTTP 404：WebSocket Path 或 Tunnel 路由不正确。"; return 1 ;;
+    *' 502 '*) ui_error "HTTP 502：Tunnel 无法连接本地 Mihomo，请核对 http://127.0.0.1:本地端口。"; return 1 ;;
+    *' 521 '*) ui_error "HTTP 521：域名可能仍指向源站，请检查是否错误保留了 A/AAAA 记录。"; return 1 ;;
+    '') ui_error "未收到响应：请检查 DNS、Tunnel 在线状态及本机网络。"; return 1 ;;
+    *) ui_error "WebSocket 握手失败：$probe_status"; ui_warn "请依次核对 Tunnel 公共主机名、Host、Path 和本地服务端口。"; return 1 ;;
   esac
 }
 
@@ -4574,33 +4765,28 @@ cloudflared_menu() {
     cf_version="$(cloudflared_version_text)"
     cf_connections="$(cloudflared_connection_count)"
     printf ' 当前状态：%s | 版本：%s | 活跃连接：%s\n' "$cf_status" "$cf_version" "$cf_connections"
-    printf ' Metrics：%s（仅本机）\n' "$CLOUDFLARED_METRICS_URL"
     ui_dash
-    printf ' %s1.%s 一键创建 Argo VLESS-WS 节点\n' "$C_GREEN" "$C_RESET"
-    printf ' %s2.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
-    printf ' %s3.%s 将已有 VLESS-WS 转换为 Argo\n' "$C_GREEN" "$C_RESET"
-    printf ' %s4.%s 查看 Argo 节点、路由信息和链接\n' "$C_GREEN" "$C_RESET"
-    printf ' %s5.%s 检测本地 WebSocket 101\n' "$C_GREEN" "$C_RESET"
-    printf ' %s6.%s 检测公网 Tunnel WebSocket 101\n' "$C_GREEN" "$C_RESET"
-    printf ' %s7.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
-    printf ' %s8.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
-    printf ' %s9.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
-    printf ' %s10.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s1.%s 安装 / 更新并配置 Tunnel Token\n' "$C_GREEN" "$C_RESET"
+    printf ' %s2.%s 查看 Argo 节点、路由信息和链接\n' "$C_GREEN" "$C_RESET"
+    printf ' %s3.%s 检测本地 WebSocket 101\n' "$C_GREEN" "$C_RESET"
+    printf ' %s4.%s 检测公网 Tunnel WebSocket 101\n' "$C_GREEN" "$C_RESET"
+    printf ' %s5.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
+    printf ' %s6.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
+    printf ' %s7.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
+    printf ' %s8.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
     printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
     ui_dash
-    ui_prompt "请输入数字选择 (0-10)："
+    ui_prompt "请输入数字选择 (0-8)："
     read -r cf_choice || return 0
     case "$cf_choice" in
-      1) create_argo_node; pause ;;
-      2) install_cloudflared; pause ;;
-      3) configure_argo_node; pause ;;
-      4) show_argo_nodes; pause ;;
-      5) test_argo_node local; pause ;;
-      6) test_argo_node public; pause ;;
-      7) restart_cloudflared; pause ;;
-      8) show_cloudflared_logs ;;
-      9) rollback_cloudflared; pause ;;
-      10) uninstall_cloudflared; pause ;;
+      1) install_cloudflared; pause ;;
+      2) show_argo_nodes; pause ;;
+      3) test_argo_node local; pause ;;
+      4) test_argo_node public; pause ;;
+      5) restart_cloudflared; pause ;;
+      6) show_cloudflared_logs ;;
+      7) rollback_cloudflared; pause ;;
+      8) uninstall_cloudflared; pause ;;
       0) return 0 ;;
       *) ui_error "无效选择。"; pause ;;
     esac
@@ -4620,6 +4806,9 @@ update_script() {
     ui_error "更新失败：无法下载最新脚本。"
     return 1
   }
+  verify_remote_checksum "$SCRIPT_RAW_URL" "$tmp_file"
+  verify_result=$?
+  [ "$verify_result" -ne 1 ] || { rm -f "$tmp_file"; return 1; }
 
   if ! grep -qi 'mihomo 一键配置管理面板' "$tmp_file"; then
     rm -f "$tmp_file"
@@ -4719,16 +4908,39 @@ health_check() {
   fi
 
   missing_listeners=0
+  wrong_listener_owner=0
+  exposed_argo_listeners=0
   if [ -s "$NODES_DB" ]; then
-    while IFS='|' read -r check_proto check_name check_port _; do
+    while IFS='|' read -r check_proto check_name check_port check_value1 check_value2 check_value3 check_value4 check_value5 check_value6; do
       case "$check_port" in ''|*[!0-9]*) continue ;; esac
-      system_port_in_use "$check_port" || missing_listeners=$((missing_listeners + 1))
+      if ! system_port_in_use "$check_port"; then
+        missing_listeners=$((missing_listeners + 1))
+        continue
+      fi
+      if command -v ss >/dev/null 2>&1 && ! port_owned_by_process "$check_port" "mihomo"; then
+        wrong_listener_owner=$((wrong_listener_owner + 1))
+      fi
+      if [ "$check_proto" = "vless-ws" ] && [ "${check_value4:-}" = "argo" ]; then
+        if ! port_bound_to_loopback "$check_port"; then
+          exposed_argo_listeners=$((exposed_argo_listeners + 1))
+        fi
+      fi
     done < "$NODES_DB"
   fi
-  if [ "$missing_listeners" -eq 0 ]; then
-    ui_success "所有节点监听端口均可在系统中找到。"
+  if [ "$missing_listeners" -eq 0 ] && [ "$wrong_listener_owner" -eq 0 ] && [ "$exposed_argo_listeners" -eq 0 ]; then
+    ui_success "节点端口均由 Mihomo 正确监听，Argo 节点仅绑定本机。"
   else
-    ui_error "有 $missing_listeners 个节点端口未监听。"
+    ui_error "监听异常：未监听 $missing_listeners，非 Mihomo 占用 $wrong_listener_owner，Argo 暴露公网 $exposed_argo_listeners。"
+    health_errors=$((health_errors + 1))
+  fi
+
+  malformed_users="$(awk -F'|' 'NF && NF < 11 { count++ } END { print count + 0 }' "$USERS_DB" 2>/dev/null)"
+  duplicate_user_names="$(awk -F'|' 'NF { count[$1]++ } END { for (n in count) if (count[n] > 1) duplicate++; print duplicate + 0 }' "$USERS_DB" 2>/dev/null)"
+  duplicate_user_ports="$(awk -F'|' 'NF >= 11 { count[$11]++ } END { for (p in count) if (p != "" && count[p] > 1) duplicate++; print duplicate + 0 }' "$USERS_DB" 2>/dev/null)"
+  if [ "${malformed_users:-0}" = "0" ] && [ "${duplicate_user_names:-0}" = "0" ] && [ "${duplicate_user_ports:-0}" = "0" ]; then
+    [ -s "$USERS_DB" ] && ui_success "用户数据库结构、名称和端口未发现冲突。"
+  else
+    ui_error "用户数据库异常：格式错误 ${malformed_users:-0}，重名 ${duplicate_user_names:-0}，重复端口 ${duplicate_user_ports:-0}。"
     health_errors=$((health_errors + 1))
   fi
 
@@ -4740,12 +4952,24 @@ health_check() {
       health_errors=$((health_errors + 1))
     fi
     token_mode="$(stat -c '%a' "$CLOUDFLARED_TOKEN_FILE" 2>/dev/null || true)"
-    if [ "$token_mode" = "600" ]; then
-      ui_success "Tunnel Token 权限为 600。"
+    token_owner="$(stat -c '%u' "$CLOUDFLARED_TOKEN_FILE" 2>/dev/null || true)"
+    if [ "$token_mode" = "600" ] && [ "$token_owner" = "0" ]; then
+      ui_success "Tunnel Token 属于 root，权限为 600。"
     else
-      ui_warn "Tunnel Token 权限不是 600（当前 ${token_mode:-未知}）。"
+      ui_warn "Tunnel Token 权限或所有者不安全（mode=${token_mode:-未知}, uid=${token_owner:-未知}）。"
       health_warnings=$((health_warnings + 1))
     fi
+  fi
+
+  for internal_port in 7890 9090 1053; do
+    if system_port_in_use "$internal_port" && command -v ss >/dev/null 2>&1 && ! port_owned_by_process "$internal_port" "mihomo"; then
+      ui_error "内部端口 $internal_port 被非 Mihomo 进程占用。"
+      health_errors=$((health_errors + 1))
+    fi
+  done
+  if system_port_in_use 20241 && command -v ss >/dev/null 2>&1 && ! port_owned_by_process 20241 "cloudflared"; then
+    ui_error "内部监控端口 20241 被非 cloudflared 进程占用。"
+    health_errors=$((health_errors + 1))
   fi
 
   if [ -d "$STATE_LOCK_DIR" ]; then
@@ -4799,6 +5023,7 @@ uninstall_all() {
   cleanup_traffic_auto_refresh
   [ "$uninstall_mode" = "2" ] && remove_cloudflared_files
   restore_sysctl_network
+  rm -f "$LOGROTATE_FILE"
   rm -f "$BIN_PATH" "$BIN_BACKUP_PATH" "$CLI_PATH" "$CLI_BACKUP_PATH"
   rm -rf "$CONFIG_DIR" "$LOG_DIR"
   if [ "$uninstall_mode" = "2" ]; then
@@ -4833,7 +5058,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_YELLOW}[+] 节点管理${C_RESET}
    ${C_GREEN}1.${C_RESET} 一键生成代理节点
    ${C_GREEN}2.${C_RESET} 查看所有节点链接
-   ${C_GREEN}3.${C_RESET} 删除特定节点
+   ${C_GREEN}3.${C_RESET} 编辑 / 删除节点
 
   ${C_YELLOW}[+] 核心管理${C_RESET}
    ${C_GREEN}4.${C_RESET} 一键安装 Mihomo 内核
@@ -4865,7 +5090,7 @@ EOF
     case "$choice" in
       1) add_node; pause ;;
       2) show_all_nodes; pause ;;
-      3) delete_node; pause ;;
+      3) node_management_menu; pause ;;
       4) install_core; pause ;;
       5) update_script; pause ;;
       6) uninstall_all; pause ;;

@@ -51,6 +51,25 @@ else
     rm -f "$tmp_file"
     exit 1
   }
+  checksum_file="$(make_temp /tmp/mh-install-sha.XXXXXX)"
+  if curl -fsSL "$RAW_BASE/mh.sh.sha256" -o "$checksum_file"; then
+    expected="$(awk 'NR == 1 { print $1 }' "$checksum_file")"
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual="$(sha256sum "$tmp_file" | awk '{ print $1 }')"
+    elif command -v openssl >/dev/null 2>&1; then
+      actual="$(openssl dgst -sha256 "$tmp_file" | awk '{ print $NF }')"
+    else
+      actual=""
+    fi
+    if [ -z "$actual" ] || [ "$expected" != "$actual" ]; then
+      rm -f "$tmp_file" "$checksum_file"
+      red "安装失败：mh.sh SHA-256 校验不通过。"
+      exit 1
+    fi
+  else
+    red "警告：无法取得 SHA-256 文件，将仅执行脚本语法检查。"
+  fi
+  rm -f "$checksum_file"
 fi
 
 if ! sh -n "$tmp_file" 2>/dev/null; then

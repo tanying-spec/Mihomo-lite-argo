@@ -1,4 +1,4 @@
-# ✨ Mihomo Lite - 一键配置脚本 V1.11.0（Argo 稳定版）
+# ✨ Mihomo Lite - 一键配置脚本 V1.12.0（Argo 稳定版）
 <!-- GitHub Badges -->
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange?logo=ubuntu)
 ![Debian](https://img.shields.io/badge/Debian-12%2B-red?logo=debian)
@@ -35,28 +35,30 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 
 * **📦 核心管理**：一键安装 / 更新 / 卸载 Mihomo 内核，更新失败自动恢复。
 * **🔗 节点生成**：一键生成代理节点，并自动输出可复制导入的节点链接。
-* **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持单节点删除、一键清空和批量重命名。
+* **📊 节点管理**：查看所有已建节点、单节点链接以及 **Base64 聚合订阅**，支持节点名称、监听端口、凭据和 WebSocket 模式编辑，也支持单节点删除、一键清空和批量重命名。
 * **⚙️ 服务运维**：一键查看 YAML 配置文件、重启服务进程。
 * **🚀 性能优化**：支持运行时参数调优、省资源稳连模式、高吞吐/跑满带宽模式、sysctl 网络优化和公网 IP 本地缓存。
 * **🌐 IPv6 支持**：支持开启 IPv6 监听、IPv6 DNS 解析和 IPv6 节点分享地址。
 * **👥 多用户管理**：可在初次安装 Mihomo 内核时选择安装，支持用户独立端口、增删启停、到期时间、独立流量配额、手动/自动流量统计和用户专属订阅分发。
 * **📡 运行监控**：实时查看 Mihomo 运行日志。
 * **🛡️ 稳定与回滚**：配置写入前执行 Mihomo 自检，服务失败自动恢复旧配置；内核、cloudflared 和管理脚本均可回滚上一版本。
-* **🧱 状态事务**：节点与多用户的重要修改使用数据库快照、并发锁和中断恢复，失败不会留下半写入状态。
+* **🧱 状态事务**：节点、多用户、运行参数、网络设置和功能开关的重要修改使用快照、并发锁和中断恢复，失败不会留下半写入状态。
 * **🔌 端口检查**：同时检查节点数据库、用户数据库和系统真实 TCP/UDP 监听端口。
+* **🔐 下载校验**：优先验证上游 SHA-256 sidecar；上游未提供时继续执行格式、语法和可执行性检查。
+* **🧹 日志保护**：安装时配置日志轮转，单文件达到 10MiB 后轮转压缩并保留 3 份。
 * **🔄 无缝升级**：支持一键更新 Mihomo、cloudflared 与管理脚本，菜单 `10` 提供版本回滚。
 * **🩺 健康检查**：菜单 `11` 或命令 `mh doctor` 检查配置、服务、数据库、监听端口、Tunnel 连接和 Token 权限。
-* **☁️ Argo Tunnel**：菜单 `88` 提供真正的一键 Argo 节点，使用 `--token-file` 运行固定隧道，并支持正确 WS-TLS 链接、WebSocket 101 检测、版本/状态/连接数展示和独立卸载。
+* **☁️ Argo Tunnel**：节点统一从菜单 `1` 创建；菜单 `88` 仅负责固定 Tunnel 的安装、更新、状态、检测、回滚和卸载。Token 使用 `--token-file` 读取。
 
 ### ☁️ Argo / Cloudflare Tunnel
 
 安装管理脚本后输入 `mh`：
 
 1. 选择 `4` 安装 Mihomo。
-2. 选择 `88` → `2`，粘贴 Cloudflare 固定 Tunnel Token；Token 仅保存在 `/etc/cloudflared/token`（权限 `600`），cloudflared 通过 `--token-file` 读取。
-3. 选择 `88` → `1` 一键创建 Argo VLESS-WS 节点：只需填写 Tunnel 公共主机名，名称、无冲突端口、UUID 和随机 Path 均可自动生成，listener 只绑定 `127.0.0.1`。
+2. 选择 `88` → `1`，粘贴 Cloudflare 固定 Tunnel Token；Token 仅保存在 `/etc/cloudflared/token`（权限 `600`），cloudflared 通过 `--token-file` 读取。
+3. 选择主菜单 `1` → `VLESS + WebSocket` → `Cloudflare Tunnel / Argo` 创建节点；填写 Tunnel 公共主机名和可选的 CF 优选 IP/域名，listener 只绑定 `127.0.0.1`。
 4. 在 Cloudflare Tunnel 后台添加公共主机名，服务填写脚本显示的 `http://127.0.0.1:<VLESS-WS 本地端口>`。
-5. 使用菜单 `88` → `5/6` 执行本地和公网检测，二者都应返回 `HTTP/1.1 101 Switching Protocols`。
+5. 使用菜单 `88` → `3/4` 执行本地和公网检测，二者都应返回 `HTTP/1.1 101 Switching Protocols`。
 
 客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
 
@@ -116,7 +118,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 | **网络参数** | `/etc/mihomo/network.env` | 存储 IPv6 开关和分享地址偏好 |
 | **公网 IP 缓存** | `/etc/mihomo/public.ip` | 缓存 IPv4 / IPv6 分享地址，默认 6 小时自动过期 |
 | **cloudflared Token** | `/etc/cloudflared/token` | 固定隧道 Token，权限 `600` |
-| **cloudflared Metrics** | `127.0.0.1:20241` | 仅本机状态与活跃连接统计 |
+| **cloudflared 内部监控** | `127.0.0.1:20241` | 仅供脚本读取 Tunnel 状态，不需要开放或映射 |
 | **日志目录** | `/var/log/mihomo/` | 存储服务的运行与连接日志 |
 
 *💡 后台守护服务名称：`mihomo`*
