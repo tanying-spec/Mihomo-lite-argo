@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.0-argo.5"
+SCRIPT_VERSION="1.12.1-argo.6"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -4463,13 +4463,35 @@ cloudflared_arch() {
   esac
 }
 
+cloudflared_memory_limit() {
+  cf_memory_mib="$(memory_limit_mib)"
+  case "$cf_memory_mib" in
+    ''|*[!0-9]*) printf '96MiB' ;;
+    *)
+      if [ "$cf_memory_mib" -le 192 ]; then
+        printf '48MiB'
+      elif [ "$cf_memory_mib" -le 256 ]; then
+        printf '64MiB'
+      elif [ "$cf_memory_mib" -le 512 ]; then
+        printf '96MiB'
+      else
+        printf '128MiB'
+      fi
+      ;;
+  esac
+}
+
 write_cloudflared_runner() {
   mkdir -p "$(dirname "$CLOUDFLARED_RUNNER")"
+  cf_go_memory="$(cloudflared_memory_limit)"
   cat > "$CLOUDFLARED_RUNNER" <<EOF
 #!/bin/sh
 set -eu
 TOKEN_FILE="$CLOUDFLARED_TOKEN_FILE"
 [ -s "\$TOKEN_FILE" ] || { echo "Cloudflare Tunnel Token 不存在" >&2; exit 1; }
+export GOMEMLIMIT="$cf_go_memory"
+export GOGC="125"
+export GODEBUG="madvdontneed=1"
 exec "$CLOUDFLARED_BIN" tunnel --no-autoupdate --protocol http2 --metrics "$CLOUDFLARED_METRICS" run --token-file "$CLOUDFLARED_TOKEN_FILE"
 EOF
   chmod 700 "$CLOUDFLARED_RUNNER"
@@ -4490,6 +4512,7 @@ Type=simple
 ExecStart=$CLOUDFLARED_RUNNER
 Restart=always
 RestartSec=5s
+LimitNOFILE=262144
 NoNewPrivileges=true
 
 [Install]
@@ -4509,24 +4532,11 @@ error_log="$CLOUDFLARED_LOG"
 supervisor="supervise-daemon"
 respawn_delay=5
 respawn_max=0
+rc_ulimit="-n 262144"
 
 depend() {
   need net
   after firewall
-}
-
-restart_cloudflared_service() {
-  manager="$(service_manager)"
-  case "$manager" in
-    systemd)
-      systemctl daemon-reload || return 1
-      systemctl restart "$CLOUDFLARED_SERVICE" || return 1
-      ;;
-    openrc) rc-service "$CLOUDFLARED_SERVICE" restart || return 1 ;;
-    *) return 1 ;;
-  esac
-  sleep 1
-  cloudflared_service_is_running
 }
 EOF
       chmod +x "/etc/init.d/${CLOUDFLARED_SERVICE}"
@@ -4538,6 +4548,22 @@ EOF
       return 1
       ;;
   esac
+}
+
+restart_cloudflared_service() {
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd)
+      systemctl daemon-reload || return 1
+      systemctl restart "$CLOUDFLARED_SERVICE" || return 1
+      ;;
+    openrc)
+      rc-service "$CLOUDFLARED_SERVICE" restart || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  sleep 2
+  cloudflared_service_is_running
 }
 
 install_cloudflared() {
@@ -4610,8 +4636,69 @@ install_cloudflared() {
 
 restart_cloudflared() {
   need_root
-  restart_cloudflared_service || { ui_error "Argo Tunnel 重启失败，请查看日志。"; return 1; }
-  ui_success "Argo Tunnel 已重启。"
+  ensure_installed
+  argo_record="$(awk -F'|' '$1 == "vless-ws" && $7 == "argo" { print; exit }' "$NODES_DB" 2>/dev/null)"
+  if [ -n "$argo_record" ]; then
+    IFS='|' read -r _ _ argo_port _ argo_path argo_host _ _ _ <<EOF
+$argo_record
+EOF
+    if ! websocket_probe "http://127.0.0.1:$argo_port$argo_path" "$argo_host"; then
+      ui_warn "本地 Argo 源站不可用，先重启 Mihomo。"
+      restart_service || { ui_error "Mihomo 源站重启失败。"; return 1; }
+    fi
+  elif ! service_is_running; then
+    ui_warn "Mihomo 未运行，先恢复 Mihomo 服务。"
+    restart_service || return 1
+  fi
+
+  write_cloudflared_runner
+  if ! write_cloudflared_service || ! cloudflared_service_is_running; then
+    ui_error "Argo Tunnel 重启失败，正在输出故障诊断。"
+    tunnel_diagnostics
+    return 1
+  fi
+  connection_wait=0
+  while [ "$connection_wait" -lt 12 ]; do
+    cf_connections="$(cloudflared_connection_count)"
+    case "$cf_connections" in ''|0|'未知'*|'不可用') sleep 1 ;; *) break ;; esac
+    connection_wait=$((connection_wait + 1))
+  done
+  ui_success "Argo Tunnel 已重启，边缘连接：${cf_connections:-未知}。"
+  if [ -n "$argo_record" ]; then
+    websocket_probe "http://127.0.0.1:$argo_port$argo_path" "$argo_host" || true
+  fi
+}
+
+tunnel_diagnostics() {
+  screen_title "Tunnel 压力与故障诊断"
+  printf ' Mihomo：%s | cloudflared：%s | 边缘连接：%s\n' \
+    "$(service_status_text)" "$(cloudflared_status_text)" "$(cloudflared_connection_count)"
+  if command -v free >/dev/null 2>&1; then
+    ui_section "内存"
+    free -m 2>/dev/null || true
+  fi
+  ui_section "进程资源（RSS 单位 KiB）"
+  ps -eo pid,rss,vsz,comm 2>/dev/null | awk 'NR == 1 || $4 ~ /mihomo|cloudflared/' || true
+  for memory_events in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.failcnt; do
+    [ -r "$memory_events" ] || continue
+    ui_section "$memory_events"
+    sed -n '1,20p' "$memory_events" 2>/dev/null || true
+  done
+  ui_section "最近的 OOM / kill 记录"
+  if command -v dmesg >/dev/null 2>&1; then
+    dmesg 2>/dev/null | grep -Ei 'out of memory|oom-kill|killed process' | tail -n 10 || ui_warn "未读取到 OOM 记录或容器禁止读取 dmesg。"
+  fi
+  ui_section "最近服务日志"
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd)
+      journalctl -u "$SERVICE_NAME" -u "$CLOUDFLARED_SERVICE" -n 30 --no-pager 2>/dev/null || true
+      ;;
+    openrc)
+      tail -n 20 "$LOG_DIR/${SERVICE_NAME}.err" "$LOG_DIR/${SERVICE_NAME}.log" "$CLOUDFLARED_LOG" 2>/dev/null || true
+      ;;
+  esac
+  ui_warn "若 oom/oom_kill 增长，说明多线程测速超过容器内存承载能力；优先使用菜单 44 的省资源稳连模式并降低测速线程数。"
 }
 
 rollback_cloudflared() {
@@ -4773,10 +4860,11 @@ cloudflared_menu() {
     printf ' %s5.%s 重启 Tunnel\n' "$C_GREEN" "$C_RESET"
     printf ' %s6.%s 查看实时日志\n' "$C_GREEN" "$C_RESET"
     printf ' %s7.%s 回滚 cloudflared 到上一版本\n' "$C_GREEN" "$C_RESET"
-    printf ' %s8.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s8.%s 压力 / OOM / 服务故障诊断\n' "$C_GREEN" "$C_RESET"
+    printf ' %s9.%s 卸载 Tunnel（不影响 Mihomo）\n' "$C_GREEN" "$C_RESET"
     printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
     ui_dash
-    ui_prompt "请输入数字选择 (0-8)："
+    ui_prompt "请输入数字选择 (0-9)："
     read -r cf_choice || return 0
     case "$cf_choice" in
       1) install_cloudflared; pause ;;
@@ -4786,7 +4874,8 @@ cloudflared_menu() {
       5) restart_cloudflared; pause ;;
       6) show_cloudflared_logs ;;
       7) rollback_cloudflared; pause ;;
-      8) uninstall_cloudflared; pause ;;
+      8) tunnel_diagnostics; pause ;;
+      9) uninstall_cloudflared; pause ;;
       0) return 0 ;;
       *) ui_error "无效选择。"; pause ;;
     esac
