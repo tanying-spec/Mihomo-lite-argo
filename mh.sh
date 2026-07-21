@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.3-argo.8"
+SCRIPT_VERSION="1.12.4-argo.9"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -452,8 +452,20 @@ remember_memory_limit_file() {
   remember_memory_limit_value "$memory_limit_value"
 }
 
+physical_memory_bytes() {
+  [ -r /proc/meminfo ] || return 0
+  awk '/^MemTotal:[[:space:]]+[0-9]+[[:space:]]+kB/ {
+    printf "%.0f\n", $2 * 1024;
+    exit;
+  }' /proc/meminfo 2>/dev/null
+}
+
 memory_limit_bytes() {
   best_memory_limit=""
+  # Full VMs and some NAT/LXC providers do not expose a usable cgroup memory
+  # controller. MemTotal is still the upper bound visible to the process, so
+  # include it and always keep the smallest trustworthy value.
+  remember_memory_limit_value "$(physical_memory_bytes)"
   for memory_limit_file in \
     /sys/fs/cgroup/memory.max \
     /sys/fs/cgroup/memory/memory.limit_in_bytes \
@@ -4222,6 +4234,14 @@ EOF
     3)
       ui_warn "高吞吐/跑满带宽模式会关闭自动流量统计，并移除 iptables 统计规则以降低包路径开销。"
       ui_warn "流量配额不会实时累计；再次执行 mh traffic 会重建统计规则。"
+      case "$detected_memory_mib" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ "$detected_memory_mib" -le 512 ]; then
+            ui_warn "当前总内存仅 ${detected_memory_mib}MiB；高吞吐模式可能挤压 cloudflared 和系统内存，不建议长期使用。"
+          fi
+          ;;
+      esac
       ui_prompt "确认应用高吞吐/跑满带宽模式？输入 y 确认："
       read -r throughput_confirm || true
       case "$throughput_confirm" in
