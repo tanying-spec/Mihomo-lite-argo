@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.2-argo.7"
+SCRIPT_VERSION="1.12.3-argo.8"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -508,6 +508,73 @@ memlimit_from_percent() {
     if (value < 32) value = 32;
     printf "%dMiB", value;
   }'
+}
+
+memlimit_mib_value() {
+  printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\)MiB$/\1/p'
+}
+
+normalize_runtime_profiles() {
+  profile_recommended_mib="$(memlimit_mib_value "$recommended_mem")"
+  profile_resource_mib="$(memlimit_mib_value "$resource_mem")"
+  profile_throughput_mib="$(memlimit_mib_value "$throughput_mem")"
+
+  case "$profile_recommended_mib:$profile_resource_mib" in
+    *[!0-9:]*|:*|*:)
+      ;;
+    *)
+      if [ "$profile_resource_mib" -ge "$profile_recommended_mib" ]; then
+        profile_resource_mib=$((profile_recommended_mib * 2 / 3))
+        profile_resource_mib=$((profile_resource_mib / 16 * 16))
+        [ "$profile_resource_mib" -lt 64 ] && profile_resource_mib=64
+        if [ "$profile_resource_mib" -ge "$profile_recommended_mib" ]; then
+          profile_resource_mib=$((profile_recommended_mib - 16))
+        fi
+        [ "$profile_resource_mib" -lt 32 ] && profile_resource_mib=32
+        resource_mem="${profile_resource_mib}MiB"
+      fi
+      ;;
+  esac
+
+  case "$profile_recommended_mib:$profile_throughput_mib" in
+    *[!0-9:]*|:*|*:)
+      ;;
+    *)
+      if [ "$profile_throughput_mib" -le "$profile_recommended_mib" ]; then
+        profile_throughput_mib=$((profile_recommended_mib * 4 / 3))
+        profile_throughput_mib=$(((profile_throughput_mib + 15) / 16 * 16))
+        [ "$profile_throughput_mib" -gt 1024 ] && profile_throughput_mib=1024
+        if [ "$profile_throughput_mib" -le "$profile_recommended_mib" ]; then
+          profile_throughput_mib=$((profile_recommended_mib + 16))
+        fi
+        throughput_mem="${profile_throughput_mib}MiB"
+      fi
+      ;;
+  esac
+
+  case "$recommended_gogc:$resource_gogc" in
+    *[!0-9:]*|:*|*:)
+      ;;
+    *)
+      if [ "$resource_gogc" -le "$recommended_gogc" ]; then
+        resource_gogc=$((recommended_gogc + 50))
+      fi
+      ;;
+  esac
+  case "$recommended_gogc:$throughput_gogc" in
+    *[!0-9:]*|:*|*:)
+      ;;
+    *)
+      if [ "$throughput_gogc" -ge "$recommended_gogc" ]; then
+        throughput_gogc=$((recommended_gogc - 50))
+        if [ "$recommended_gogc" -gt 75 ] && [ "$throughput_gogc" -lt 75 ]; then
+          throughput_gogc=75
+        elif [ "$throughput_gogc" -lt 50 ]; then
+          throughput_gogc=50
+        fi
+      fi
+      ;;
+  esac
 }
 
 recommended_runtime() {
@@ -4105,6 +4172,7 @@ performance_tuning_menu() {
     [ "$resource_gogc" -lt 200 ] && resource_gogc="200"
     [ "$throughput_gogc" -lt 175 ] && throughput_gogc="175"
   fi
+  normalize_runtime_profiles
 
   screen_title "性能优化菜单"
   cat <<EOF
@@ -4121,6 +4189,11 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 返回主菜单
 ${C_CYAN}====================================================${C_RESET}
 EOF
+  case "$detected_memory_mib" in
+    ''|*[!0-9]*)
+      ui_warn "未检测到可信的 cgroup/容器内存上限；当前使用保守兜底档位，高吞吐模式前请确认实际可用内存。"
+      ;;
+  esac
   ui_prompt "请输入数字选择 (0-4)："
   read -r perf_choice || true
 
