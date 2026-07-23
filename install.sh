@@ -3,6 +3,7 @@
 set -u
 
 RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main}"
+LOCAL_SCRIPT="${MH_LOCAL_SCRIPT:-}"
 CLI_PATH="/usr/local/bin/mh"
 CLI_BACKUP_PATH="/usr/local/bin/mh.previous"
 
@@ -49,8 +50,13 @@ need_root
 install_curl
 
 tmp_file="$(make_temp /tmp/mh-install.XXXXXX)"
-if [ -f "./mh.sh" ]; then
-  cp ./mh.sh "$tmp_file"
+if [ -n "$LOCAL_SCRIPT" ]; then
+  if [ ! -f "$LOCAL_SCRIPT" ]; then
+    rm -f "$tmp_file"
+    red "MH_LOCAL_SCRIPT 指定的文件不存在：$LOCAL_SCRIPT"
+    exit 1
+  fi
+  cp "$LOCAL_SCRIPT" "$tmp_file"
 else
   curl -fsSL "$RAW_BASE/mh.sh" -o "$tmp_file" || {
     rm -f "$tmp_file"
