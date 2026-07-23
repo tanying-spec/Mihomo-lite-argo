@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.17"
+SCRIPT_VERSION="1.12.4-argo.18"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -4561,9 +4561,150 @@ migrate_legacy_sysctl_config() {
   ui_success "已清理旧版激进 sysctl 持久化配置；当前运行参数未被更改。"
 }
 
+network_metric_value() {
+  network_metric_name="$1"
+  if command -v nstat >/dev/null 2>&1; then
+    nstat -az 2>/dev/null | awk -v name="$network_metric_name" '$1 == name { print $2 + 0; found = 1; exit } END { if (!found) print 0 }'
+  else
+    printf '0'
+  fi
+}
+
+show_network_status() {
+  screen_title "当前网络状态"
+  network_interface="$(ip route 2>/dev/null | awk '$1 == "default" { print $5; exit }')"
+  network_mtu="未知"
+  [ -n "$network_interface" ] && network_mtu="$(cat "/sys/class/net/$network_interface/mtu" 2>/dev/null || printf '未知')"
+  network_memory="$(memory_limit_mib)"
+  network_connections="$(ss -Htan state established 2>/dev/null | wc -l | tr -d ' ')"
+  network_timewait="$(ss -Htan state time-wait 2>/dev/null | wc -l | tr -d ' ')"
+  network_congestion="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
+  network_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '由宿主机管理')"
+  network_retrans="$(network_metric_value TcpRetransSegs)"
+  network_timeouts="$(network_metric_value TcpExtTCPTimeouts)"
+  network_udp_errors="$(network_metric_value UdpRcvbufErrors)"
+  network_listen_drops="$(network_metric_value TcpExtListenDrops)"
+  network_oom="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+  printf ' 网卡：%s  |  MTU：%s\n' "${network_interface:-未知}" "$network_mtu"
+  printf ' 拥塞控制：%s  |  qdisc：%s\n' "$network_congestion" "$network_qdisc"
+  printf ' 内存限制：%s MiB  |  OOM Kill：%s\n' "${network_memory:-未知}" "${network_oom:-未知}"
+  printf ' 当前连接：%s  |  TIME_WAIT：%s\n' "${network_connections:-0}" "${network_timewait:-0}"
+  printf ' 累计 TCP 重传：%s  |  TCP 超时：%s\n' "${network_retrans:-未知}" "${network_timeouts:-未知}"
+  printf ' UDP 缓冲错误：%s  |  监听丢弃：%s\n' "${network_udp_errors:-未知}" "${network_listen_drops:-未知}"
+  if [ "$network_udp_errors" = "0" ] && [ "$network_listen_drops" = "0" ]; then
+    ui_success "未发现 UDP 缓冲或监听队列瓶颈。"
+  fi
+  if [ "$network_qdisc" = "由宿主机管理" ]; then
+    ui_warn "当前为容器网络，qdisc 和部分 net.core 参数由宿主机管理。"
+  fi
+}
+
+show_applied_network_settings() {
+  screen_title "已应用的网络优化"
+  if [ ! -s "$SYSCTL_CONF_FILE" ]; then
+    ui_warn "当前没有由本脚本持久化的网络优化参数。"
+    return 0
+  fi
+  applied_count=0
+  while IFS='=' read -r applied_key applied_expected; do
+    applied_key="$(printf '%s' "$applied_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    applied_expected="$(printf '%s' "$applied_expected" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$applied_key" in ''|'#'*) continue ;; esac
+    applied_actual="$(sysctl -n "$applied_key" 2>/dev/null || true)"
+    if [ -z "$applied_actual" ]; then
+      printf ' [未生效] %s = %s（当前环境不支持或不可见）\n' "$applied_key" "$applied_expected"
+    elif [ "$(printf '%s' "$applied_actual" | tr -s '[:space:]' ' ')" = "$(printf '%s' "$applied_expected" | tr -s '[:space:]' ' ')" ]; then
+      printf ' [已生效] %s = %s\n' "$applied_key" "$applied_actual"
+    else
+      printf ' [不一致] %s：期望 %s，实际 %s\n' "$applied_key" "$applied_expected" "$applied_actual"
+    fi
+    applied_count=$((applied_count + 1))
+  done < "$SYSCTL_CONF_FILE"
+  [ "$applied_count" -gt 0 ] || ui_warn "配置文件中没有实际优化参数。"
+  [ -s "$SYSCTL_BACKUP_FILE" ] && ui_success "原始参数快照已保留，可使用菜单 4 恢复。"
+}
+
+restore_network_settings_prompt() {
+  screen_title "恢复修改前的网络参数"
+  ui_warn "该操作会恢复脚本首次修改前记录的 sysctl，并删除本脚本的持久化网络配置。"
+  ui_prompt "确认恢复？输入 RESTORE："
+  read -r restore_confirm || true
+  if [ "$restore_confirm" != "RESTORE" ]; then
+    ui_warn "已取消恢复。"
+    return 0
+  fi
+  restore_sysctl_network
+}
+
+network_optimization_menu() {
+  while true; do
+    screen_title "网络诊断与无损优化"
+    printf ' %s1.%s 查看当前网络状态\n' "$C_GREEN" "$C_RESET"
+    printf ' %s2.%s 一键测试并应用经过验证的优化（约 25 MB）\n' "$C_GREEN" "$C_RESET"
+    printf ' %s3.%s 查看已经应用的优化参数\n' "$C_GREEN" "$C_RESET"
+    printf ' %s4.%s 恢复修改前的网络参数\n' "$C_GREEN" "$C_RESET"
+    printf ' %s0.%s 返回主菜单\n' "$C_GREEN" "$C_RESET"
+    ui_prompt "请输入数字选择 (0-4)："
+    read -r network_choice || return 0
+    case "$network_choice" in
+      1) show_network_status; pause ;;
+      2) optimize_sysctl_network; pause ;;
+      3) show_applied_network_settings; pause ;;
+      4) restore_network_settings_prompt; pause ;;
+      0) return 0 ;;
+      *) ui_error "无效选择。"; pause ;;
+    esac
+  done
+}
+
 optimize_sysctl_network() {
   need_root
-  screen_title "sysctl 网络优化"
+  screen_title "一键网络测试与优化"
+  ensure_curl
+  ui_warn "将通过当前 Mihomo 本地代理下载约 25 MB 测试数据；测试失败时不会修改参数。"
+  test_retrans_before="$(network_metric_value TcpRetransSegs)"
+  test_timeouts_before="$(network_metric_value TcpExtTCPTimeouts)"
+  test_udp_before="$(network_metric_value UdpRcvbufErrors)"
+  test_drops_before="$(network_metric_value TcpExtListenDrops)"
+  test_oom_before="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || printf '0')"
+  test_output_file="$(make_temp /tmp/mihomo-network-test.XXXXXX)"
+  if service_is_running; then
+    test_proxy_args="--proxy http://127.0.0.1:7890"
+  else
+    test_proxy_args=""
+  fi
+  # shellcheck disable=SC2086
+  if ! curl -4 -sS --max-time 60 $test_proxy_args -o /dev/null \
+      -w '%{http_code}|%{size_download}|%{speed_download}|%{time_starttransfer}\n' \
+      'https://speed.cloudflare.com/__down?bytes=25000000' > "$test_output_file"; then
+    rm -f "$test_output_file"
+    ui_error "网络测试失败，未修改任何参数。"
+    return 1
+  fi
+  IFS='|' read -r test_http_code test_bytes test_speed test_ttfb < "$test_output_file" || true
+  rm -f "$test_output_file"
+  case "$test_bytes:$test_speed" in *[!0-9:.]*|:*|*:) ui_error "网络测试结果无效，未修改任何参数。"; return 1 ;; esac
+  if [ "$test_http_code" != "200" ] || [ "$test_bytes" -lt 20000000 ]; then
+    ui_error "网络测试未完成（HTTP $test_http_code，接收 $test_bytes 字节），未修改任何参数。"
+    return 1
+  fi
+  test_mbps="$(awk -v speed="$test_speed" 'BEGIN { printf "%.2f", speed * 8 / 1000000 }')"
+  test_ttfb_ms="$(awk -v value="$test_ttfb" 'BEGIN { printf "%.1f", value * 1000 }')"
+  test_retrans_after="$(network_metric_value TcpRetransSegs)"
+  test_timeouts_after="$(network_metric_value TcpExtTCPTimeouts)"
+  test_udp_after="$(network_metric_value UdpRcvbufErrors)"
+  test_drops_after="$(network_metric_value TcpExtListenDrops)"
+  test_oom_after="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || printf '0')"
+  printf ' 测试吞吐：%s Mbps  |  首字节：%s ms\n' "$test_mbps" "$test_ttfb_ms"
+  printf ' 增量：TCP 重传 +%s，TCP 超时 +%s，UDP 缓冲错误 +%s，监听丢弃 +%s，OOM Kill +%s\n' \
+    "$((test_retrans_after - test_retrans_before))" "$((test_timeouts_after - test_timeouts_before))" \
+    "$((test_udp_after - test_udp_before))" "$((test_drops_after - test_drops_before))" "$((test_oom_after - test_oom_before))"
+  if [ "$test_oom_after" -gt "$test_oom_before" ]; then
+    ui_error "测试期间发生 OOM Kill，拒绝应用任何参数。"
+    return 1
+  fi
+  ui_success "网络测试完成，开始应用仅经过验证的安全设置。"
+
   network_memory_mib="$(memory_limit_mib)"
   network_congestion="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   network_available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf '未知')"
@@ -4581,15 +4722,6 @@ optimize_sysctl_network() {
   printf ' 累计指标：TCP 重传 %s，UDP 缓冲错误 %s，监听丢弃 %s\n' "$network_retrans" "$network_udp_errors" "$network_listen_drops"
   ui_warn "无损模式不会修改 TCP/UDP 缓冲、TIME_WAIT、Keepalive、端口范围或超大连接队列。"
   ui_warn "容器不可见的 net.core 参数由宿主机管理，脚本不会伪报优化成功。"
-  ui_prompt "确认应用无损网络优化并清理旧版激进配置？输入 y 确认："
-  read -r confirm || true
-  case "$confirm" in
-    y|Y|yes|YES) ;;
-    *)
-      ui_warn "已取消 sysctl 网络优化。"
-      return 0
-      ;;
-  esac
 
   command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr 2>/dev/null || true
 
@@ -5833,7 +5965,8 @@ case "${1:-}" in
   rename|rename-all|33) rename_all_nodes ;;
   perf|performance|tune|44) performance_tuning_menu ;;
   apply-runtime|runtime-apply) apply_saved_runtime_service ;;
-  sysctl|netopt|55) optimize_sysctl_network ;;
+  sysctl|netopt|55) network_optimization_menu ;;
+  netopt-apply|network-apply) optimize_sysctl_network ;;
   network-migrate|net-migrate) need_root; migrate_legacy_sysctl_config ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   argo|tunnel|cloudflared|88) cloudflared_menu ;;
