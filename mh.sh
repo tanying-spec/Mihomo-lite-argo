@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.18"
+SCRIPT_VERSION="1.12.4-argo.19"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -5916,7 +5916,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}22.${C_RESET} 一键生成 Reality + Hysteria2 + AnyTLS
    ${C_GREEN}33.${C_RESET} 一键重命名所有节点
    ${C_GREEN}44.${C_RESET} 性能优化菜单
-   ${C_GREEN}55.${C_RESET} sysctl 网络优化
+   ${C_GREEN}55.${C_RESET} 网络状态与一键优化
    ${C_GREEN}66.${C_RESET} IPv6 支持设置
 $multi_user_menu_line
    ${C_GREEN}88.${C_RESET} Argo / Cloudflare Tunnel 管理
@@ -5942,7 +5942,7 @@ EOF
       22) add_combo_nodes; pause ;;
       33) rename_all_nodes; pause ;;
       44) performance_tuning_menu; pause ;;
-      55) optimize_sysctl_network; pause ;;
+      55) network_optimization_menu ;;
       66) ipv6_settings_menu; pause ;;
       88) cloudflared_menu ;;
       77)
