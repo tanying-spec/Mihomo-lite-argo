@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 * **🔐 下载校验**：优先验证上游 SHA-256 sidecar；上游未提供时继续执行格式、语法和可执行性检查。
 * **🧹 日志保护**：安装时配置日志轮转，单文件达到 10MiB 后轮转压缩并保留 3 份。
 * **🧯 压力恢复**：Tunnel 重启会修复服务模板、检查本地 Mihomo 源站并等待边缘连接恢复；菜单 `88` 提供 OOM、内存、进程和日志诊断。
-* **♻️ 自动恢复**：固定 Tunnel 安装后自动启用轻量健康守护；每分钟检查进程、本地 WS 源站和边缘连接，连续异常2次才修复，并设置5分钟冷却避免重启风暴。
+* **♻️ 自动恢复**：固定 Tunnel 安装后自动启用轻量健康守护；每分钟检查真实 cloudflared 进程、本地 WS 源站和边缘连接，连续异常2次才修复，并设置5分钟冷却避免重启风暴；不会把仍存活的 OpenRC supervisor 误判为 Tunnel 正常。
 * **🔄 无缝升级**：支持一键更新 Mihomo、cloudflared 与管理脚本，菜单 `10` 提供版本回滚。
 * **🩺 健康检查**：菜单 `11` 或命令 `mh doctor` 检查配置、服务、数据库、监听端口、DNS 上游、公共 UDP/TCP 53、Tunnel 连接和 Token 权限，并明确区分节点监听故障与 DNS 上游不可达。
 * **☁️ Argo Tunnel**：节点统一从菜单 `1` 创建；菜单 `88` 仅负责固定 Tunnel 的安装、更新、状态、检测、回滚和卸载。Token 使用 `--token-file` 读取。

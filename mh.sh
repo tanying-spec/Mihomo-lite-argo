@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.12"
+SCRIPT_VERSION="1.12.4-argo.13"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -4698,16 +4698,13 @@ EOF
 }
 
 cloudflared_status_text() {
-  manager="$(service_manager)"
-  case "$manager" in
-    systemd)
-      systemctl is-active --quiet "$CLOUDFLARED_SERVICE" 2>/dev/null && printf '运行中' || printf '未运行'
-      ;;
-    openrc)
-      rc-service "$CLOUDFLARED_SERVICE" status >/dev/null 2>&1 && printf '运行中' || printf '未运行'
-      ;;
-    *) printf '未知' ;;
-  esac
+  if cloudflared_service_is_running; then
+    printf '运行中'
+  elif [ "$(service_manager)" = "unknown" ]; then
+    printf '未知'
+  else
+    printf '未运行'
+  fi
 }
 
 cloudflared_version_text() {
@@ -4728,8 +4725,23 @@ cloudflared_connection_count() {
   '
 }
 
+cloudflared_process_is_running() {
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x cloudflared >/dev/null 2>&1 && return 0
+  fi
+  if command -v pidof >/dev/null 2>&1; then
+    pidof cloudflared >/dev/null 2>&1 && return 0
+  fi
+  ps 2>/dev/null | awk '$0 ~ /[\/]usr[\/]local[\/]bin[\/]cloudflared/ && $0 !~ /supervise-daemon/ { found=1 } END { exit !found }'
+}
+
 cloudflared_service_is_running() {
-  [ "$(cloudflared_status_text)" = "运行中" ]
+  manager="$(service_manager)"
+  case "$manager" in
+    systemd) systemctl is-active --quiet "$CLOUDFLARED_SERVICE" 2>/dev/null && cloudflared_process_is_running ;;
+    openrc) rc-service "$CLOUDFLARED_SERVICE" status >/dev/null 2>&1 && cloudflared_process_is_running ;;
+    *) return 1 ;;
+  esac
 }
 
 cloudflared_arch() {
@@ -4842,8 +4854,13 @@ restart_cloudflared_service() {
       ;;
     *) return 1 ;;
   esac
-  sleep 2
-  cloudflared_service_is_running
+  cloudflared_wait=0
+  while [ "$cloudflared_wait" -lt 15 ]; do
+    cloudflared_service_is_running && return 0
+    sleep 1
+    cloudflared_wait=$((cloudflared_wait + 1))
+  done
+  return 1
 }
 
 install_cloudflared() {
