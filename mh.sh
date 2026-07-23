@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.11"
+SCRIPT_VERSION="1.12.4-argo.12"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -1899,19 +1899,51 @@ EOF
   restart_service || return 1
 }
 
+mihomo_process_is_running() {
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x mihomo >/dev/null 2>&1 && return 0
+  fi
+  if command -v pidof >/dev/null 2>&1; then
+    pidof mihomo >/dev/null 2>&1 && return 0
+  fi
+  ps 2>/dev/null | awk '$0 ~ /[\/]usr[\/]local[\/]bin[\/]mihomo/ && $0 !~ /supervise-daemon/ { found=1 } END { exit !found }'
+}
+
 service_is_running() {
   manager="$(service_manager)"
   case "$manager" in
-    systemd) systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null ;;
-    openrc) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+    systemd) systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && mihomo_process_is_running ;;
+    openrc) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 && mihomo_process_is_running ;;
     *) return 1 ;;
   esac
+}
+
+wait_service_running() {
+  wait_service_count=0
+  while [ "$wait_service_count" -lt 10 ]; do
+    if service_is_running && system_port_in_use 7890 && system_port_in_use 9090 && system_port_in_use 1053; then
+      return 0
+    fi
+    sleep 1
+    wait_service_count=$((wait_service_count + 1))
+  done
+  return 1
 }
 
 restart_service() {
   dns_recovery_attempt="${1:-0}"
   if [ "$dns_recovery_attempt" = "0" ]; then
     dns_preflight_repair || return 1
+  fi
+  if [ -x "$BIN_PATH" ] && [ -f "$CONFIG_FILE" ] && ! "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$CONFIG_FILE" >/dev/null 2>&1; then
+    ui_error "Mihomo 当前配置未通过启动前检查，已取消重启。"
+    if [ -f "$CONFIG_PENDING_FILE" ] && [ -f "$CONFIG_BACKUP_FILE" ]; then
+      cp "$CONFIG_BACKUP_FILE" "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+      rm -f "$CONFIG_PENDING_FILE" "$CONFIG_BACKUP_FILE"
+      ui_warn "已恢复上一份有效配置，当前运行中的 Mihomo 未被中断。"
+    fi
+    return 1
   fi
   manager="$(service_manager)"
   restart_result=0
@@ -1929,7 +1961,7 @@ restart_service() {
       ;;
   esac
 
-  if [ "$restart_result" = "0" ] && service_is_running; then
+  if [ "$restart_result" = "0" ] && wait_service_running; then
     if ! configured_dns_works; then
       if [ "$dns_recovery_attempt" = "0" ]; then
         ui_warn "Mihomo 启动后 DNS 验证失败，正在重新选择上游并复验一次。"
@@ -1951,7 +1983,7 @@ restart_service() {
       openrc) rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || true ;;
     esac
     rm -f "$CONFIG_PENDING_FILE" "$CONFIG_BACKUP_FILE"
-    if service_is_running; then
+    if wait_service_running; then
       ui_warn "已恢复旧配置，Mihomo 服务重新运行。"
     else
       ui_error "旧配置也未能启动，请查看服务日志。"
@@ -5459,7 +5491,10 @@ health_check() {
   fi
 
   for internal_port in 7890 9090 1053; do
-    if system_port_in_use "$internal_port" && command -v ss >/dev/null 2>&1 && ! port_owned_by_process "$internal_port" "mihomo"; then
+    if ! system_port_in_use "$internal_port"; then
+      ui_error "Mihomo 内部端口 $internal_port 未监听。"
+      health_errors=$((health_errors + 1))
+    elif command -v ss >/dev/null 2>&1 && ! port_owned_by_process "$internal_port" "mihomo"; then
       ui_error "内部端口 $internal_port 被非 Mihomo 进程占用。"
       health_errors=$((health_errors + 1))
     fi
