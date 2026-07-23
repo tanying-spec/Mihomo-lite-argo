@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.9"
+SCRIPT_VERSION="1.12.4-argo.10"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -13,6 +13,8 @@ CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 CONFIG_BACKUP_FILE="$CONFIG_DIR/config.yaml.previous"
 CONFIG_PENDING_FILE="$CONFIG_DIR/.config-pending"
+DNS_STATE_FILE="$CONFIG_DIR/dns.state"
+DNS_TEST_NAME="${MIHOMO_DNS_TEST_NAME:-www.cloudflare.com}"
 STATE_LOCK_DIR="$CONFIG_DIR/state.lock"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
@@ -1523,6 +1525,138 @@ render_user_listeners() {
   done < "$USERS_DB"
 }
 
+dns_is_address() {
+  case "${1:-}" in
+    ''|0.0.0.0|::|*[!0-9A-Fa-f:.]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+system_dns_candidates() {
+  [ -r /etc/resolv.conf ] || return 0
+  awk '/^[[:space:]]*nameserver[[:space:]]+/ { print $2 }' /etc/resolv.conf 2>/dev/null |
+    awk 'NF && !seen[$0]++'
+}
+
+run_with_timeout() {
+  run_timeout="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$run_timeout" "$@"
+  else
+    "$@"
+  fi
+}
+
+dns_udp_query_works() {
+  dns_test_server="$1"
+  dns_is_address "$dns_test_server" || return 1
+  if command -v nslookup >/dev/null 2>&1; then
+    if dns_lookup_output="$(run_with_timeout 6 nslookup "$DNS_TEST_NAME" "$dns_test_server" 2>/dev/null)"; then
+      printf '%s\n' "$dns_lookup_output" | grep -Eq '(^Name:|^Address [0-9]+:|has address|canonical name)' && return 0
+    fi
+  fi
+  if command -v dig >/dev/null 2>&1; then
+    run_with_timeout 6 dig +time=2 +tries=1 +short @"$dns_test_server" "$DNS_TEST_NAME" A 2>/dev/null |
+      grep -Eq '^[0-9A-Fa-f:.]+$' && return 0
+  fi
+  return 1
+}
+
+dns_tcp_53_works() {
+  dns_test_server="$1"
+  dns_is_address "$dns_test_server" || return 1
+  if command -v dig >/dev/null 2>&1; then
+    run_with_timeout 6 dig +tcp +time=2 +tries=1 +short @"$dns_test_server" "$DNS_TEST_NAME" A 2>/dev/null |
+      grep -Eq '^[0-9A-Fa-f:.]+$' && return 0
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    run_with_timeout 5 nc -z -w 3 "$dns_test_server" 53 >/dev/null 2>&1 && return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    run_with_timeout 5 curl -sS --connect-timeout 3 "telnet://$dns_test_server:53" </dev/null >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+probe_public_dns() {
+  dns_public_udp=""
+  dns_public_tcp=""
+  for dns_public in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    if dns_udp_query_works "$dns_public"; then
+      dns_public_udp="${dns_public_udp}${dns_public_udp:+ }$dns_public"
+    fi
+    if dns_tcp_53_works "$dns_public"; then
+      dns_public_tcp="${dns_public_tcp}${dns_public_tcp:+ }$dns_public"
+    fi
+  done
+}
+
+select_working_dns() {
+  dns_selected=""
+  dns_system_working=""
+  for dns_candidate in $(system_dns_candidates); do
+    dns_is_address "$dns_candidate" || continue
+    if dns_udp_query_works "$dns_candidate"; then
+      dns_system_working="${dns_system_working}${dns_system_working:+ }$dns_candidate"
+      dns_selected="$dns_candidate"
+      break
+    fi
+  done
+
+  probe_public_dns
+  if [ -z "$dns_selected" ]; then
+    for dns_candidate in $dns_public_udp; do
+      dns_selected="${dns_selected}${dns_selected:+ }$dns_candidate"
+      [ "$(printf '%s\n' "$dns_selected" | wc -w | tr -d ' ')" -ge 2 ] && break
+    done
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'checked_at=%s\n' "$(date +%s 2>/dev/null || printf 0)"
+    printf 'system_working=%s\n' "$dns_system_working"
+    printf 'public_udp=%s\n' "$dns_public_udp"
+    printf 'public_tcp=%s\n' "$dns_public_tcp"
+    printf 'selected=%s\n' "$dns_selected"
+  } > "$DNS_STATE_FILE"
+  chmod 600 "$DNS_STATE_FILE"
+  [ -n "$dns_selected" ]
+}
+
+configured_dns_servers() {
+  [ -r "$CONFIG_FILE" ] || return 0
+  awk '
+    /^[[:space:]]*nameserver:[[:space:]]*$/ { in_nameserver=1; next }
+    in_nameserver && /^[[:space:]]*-[[:space:]]*/ {
+      value=$0; sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+      sub(/[[:space:]#].*$/, "", value); gsub(/"/, "", value)
+      if (value ~ /^[0-9A-Fa-f:.]+$/) print value
+      next
+    }
+    in_nameserver { exit }
+  ' "$CONFIG_FILE"
+}
+
+configured_dns_works() {
+  for dns_candidate in $(configured_dns_servers); do
+    dns_udp_query_works "$dns_candidate" && return 0
+  done
+  return 1
+}
+
+dns_preflight_repair() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  configured_dns_works && return 0
+  ui_warn "DNS 上游不可达，正在自动选择有效的系统或公共 DNS。"
+  if ! select_working_dns; then
+    ui_error "未找到能够完成解析的 DNS 上游；已停止重启，节点配置本身未判定为故障。"
+    return 1
+  fi
+  render_config || return 1
+  ui_success "DNS 已自动迁移为可用上游：$dns_selected"
+}
+
 render_config() {
   mkdir -p "$CONFIG_DIR" "$LOG_DIR"
   load_network_settings
@@ -1538,6 +1672,12 @@ render_config() {
     chmod 600 "$secret_file"
   fi
   controller_secret="$(cat "$secret_file")"
+
+  if ! select_working_dns; then
+    ui_error "未检测到可用 DNS 上游，拒绝生成包含无效公共 DNS 的配置。"
+    rm -f "$tmp_file"
+    return 1
+  fi
 
   cat > "$tmp_file" <<EOF
 mixed-port: 7890
@@ -1557,16 +1697,10 @@ dns:
   ipv6: $cfg_ipv6
   enhanced-mode: redir-host
   nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
 EOF
-
-  if [ "$cfg_ipv6" = "true" ]; then
-    cat >> "$tmp_file" <<'EOF'
-    - 2606:4700:4700::1111
-    - 2001:4860:4860::8888
-EOF
-  fi
+  for cfg_dns_server in $dns_selected; do
+    printf '    - %s\n' "$cfg_dns_server" >> "$tmp_file"
+  done
 
   if [ -s "$NODES_DB" ]; then
     printf 'listeners:\n' >> "$tmp_file"
@@ -1770,6 +1904,10 @@ service_is_running() {
 }
 
 restart_service() {
+  dns_recovery_attempt="${1:-0}"
+  if [ "$dns_recovery_attempt" = "0" ]; then
+    dns_preflight_repair || return 1
+  fi
   manager="$(service_manager)"
   restart_result=0
   case "$manager" in
@@ -1787,6 +1925,14 @@ restart_service() {
   esac
 
   if [ "$restart_result" = "0" ] && service_is_running; then
+    if ! configured_dns_works; then
+      if [ "$dns_recovery_attempt" = "0" ]; then
+        ui_warn "Mihomo 启动后 DNS 验证失败，正在重新选择上游并复验一次。"
+        select_working_dns && render_config && restart_service 1 && return 0
+      fi
+      ui_error "Mihomo 服务已启动，但 DNS 上游仍不可达；节点监听与 DNS 故障需分别排查。"
+      return 1
+    fi
     rm -f "$CONFIG_PENDING_FILE" "$CONFIG_BACKUP_FILE"
     return 0
   fi
@@ -5150,6 +5296,11 @@ update_script() {
   mv "$tmp_file" "$CLI_PATH"
   ui_success "脚本更新完成。重新输入 mh 可打开新版管理面板。"
   if [ -x "$BIN_PATH" ] && [ -f "$CONFIG_FILE" ]; then
+    if "$CLI_PATH" dns-migrate >/dev/null 2>&1; then
+      ui_success "已自动检查并迁移 DNS 配置。"
+    else
+      ui_warn "DNS 自动迁移未完成，请执行 mh dns-migrate 查看详细原因。"
+    fi
     ui_prompt "是否立即使用新版脚本重写服务运行参数并重启 Mihomo？[y/N]："
     read -r apply_runtime_confirm || true
     case "$apply_runtime_confirm" in
@@ -5212,6 +5363,27 @@ health_check() {
   else
     ui_error "Mihomo 服务未运行。"
     health_errors=$((health_errors + 1))
+  fi
+
+  dns_upstreams="$(configured_dns_servers | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if configured_dns_works; then
+    ui_success "DNS 上游可完成解析：${dns_upstreams:-未列出地址}。"
+  else
+    ui_error "DNS 上游不可达：${dns_upstreams:-配置缺失}。这是 DNS 故障，不代表节点监听故障。"
+    health_errors=$((health_errors + 1))
+  fi
+  probe_public_dns
+  if [ -n "$dns_public_udp" ]; then
+    ui_success "公共 DNS UDP/53 可用：$dns_public_udp。"
+  else
+    ui_warn "公共 DNS UDP/53 均不可用；将优先使用系统有效 DNS。"
+    health_warnings=$((health_warnings + 1))
+  fi
+  if [ -n "$dns_public_tcp" ]; then
+    ui_success "公共 DNS TCP/53 可用：$dns_public_tcp。"
+  else
+    ui_warn "公共 DNS TCP/53 均不可用或系统缺少可用探测工具。"
+    health_warnings=$((health_warnings + 1))
   fi
 
   malformed_nodes="$(awk -F'|' 'NF && NF != 9 { count++ } END { print count + 0 }' "$NODES_DB" 2>/dev/null)"
@@ -5460,6 +5632,7 @@ case "${1:-}" in
   config) show_config ;;
   delete|del|remove) delete_node ;;
   restart) need_root; ensure_installed; restart_service ;;
+  dns-migrate|dns-repair) need_root; ensure_installed; dns_preflight_repair && restart_service 1 ;;
   logs|log) show_logs ;;
   update) update_script ;;
   rollback) version_rollback_menu ;;
