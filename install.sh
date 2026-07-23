@@ -94,4 +94,7 @@ fi
 chmod +x "$tmp_file"
 [ -f "$CLI_PATH" ] && cp "$CLI_PATH" "$CLI_BACKUP_PATH" && chmod 700 "$CLI_BACKUP_PATH"
 mv "$tmp_file" "$CLI_PATH"
+if [ -f /etc/mihomo/config.yaml ]; then
+  "$CLI_PATH" network-migrate >/dev/null 2>&1 || true
+fi
 green "安装完成。现在可以输入 mh 打开管理面板。"
