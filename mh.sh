@@ -1645,10 +1645,23 @@ configured_dns_works() {
   return 1
 }
 
+configured_dns_is_legacy_default() {
+  dns_configured_list="$(configured_dns_servers | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  case "$dns_configured_list" in
+    "1.1.1.1 8.8.8.8"|"1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 dns_preflight_repair() {
   [ -f "$CONFIG_FILE" ] || return 0
-  configured_dns_works && return 0
-  ui_warn "DNS 上游不可达，正在自动选择有效的系统或公共 DNS。"
+  dns_repair_reason="DNS 上游不可达"
+  if configured_dns_is_legacy_default; then
+    dns_repair_reason="检测到旧版硬编码 DNS"
+  elif configured_dns_works; then
+    return 0
+  fi
+  ui_warn "$dns_repair_reason，正在自动选择有效的系统或公共 DNS。"
   if ! select_working_dns; then
     ui_error "未找到能够完成解析的 DNS 上游；已停止重启，节点配置本身未判定为故障。"
     return 1
