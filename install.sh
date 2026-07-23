@@ -11,7 +11,12 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 
 need_root() {
   if [ "$(id -u)" != "0" ]; then
-    red "请使用 root 权限运行安装脚本：curl -fsSL <install.sh> | sudo sh"
+    red "安装需要 root 权限。"
+    if command -v sudo >/dev/null 2>&1; then
+      red "请重新执行：curl -fsSL <install.sh> | sudo sh"
+    else
+      red "当前系统没有 sudo。请先执行 su - 切换到 root，再运行：curl -fsSL <install.sh> | sh"
+    fi
     exit 1
   fi
 }
@@ -49,6 +54,8 @@ if [ -f "./mh.sh" ]; then
 else
   curl -fsSL "$RAW_BASE/mh.sh" -o "$tmp_file" || {
     rm -f "$tmp_file"
+    red "下载 mh.sh 失败。请检查网络、DNS 或 GitHub 访问是否正常。"
+    red "如果同时看到 curl: (23)，通常是管道右侧命令提前退出，并非磁盘写入故障。"
     exit 1
   }
   checksum_file="$(make_temp /tmp/mh-install-sha.XXXXXX)"

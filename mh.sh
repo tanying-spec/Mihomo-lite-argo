@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.10"
+SCRIPT_VERSION="1.12.4-argo.11"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -92,7 +92,12 @@ ui_error() { printf '%s[x]%s %s\n' "$C_RED" "$C_RESET" "$1"; }
 
 need_root() {
   if [ "$(id -u)" != "0" ]; then
-    red "请使用 root 权限运行：sudo mh"
+    red "此操作需要 root 权限。"
+    if command -v sudo >/dev/null 2>&1; then
+      red "请执行：sudo mh ${1:-}"
+    else
+      red "当前系统没有 sudo。请先执行 su - 切换到 root，再运行 mh。"
+    fi
     exit 1
   fi
 }

@@ -22,8 +22,10 @@
 请在具有 `root` 权限的终端中执行以下一键安装命令：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/install.sh | sh
 ```
+
+以上命令应在 `root` 用户下执行，适用于默认没有 `sudo` 的 Alpine 最小系统。如果当前不是 root：系统已安装 `sudo` 时可将结尾改为 `| sudo sh`；没有 `sudo` 时先执行 `su -`，再运行上面的命令。
 
 安装完成后输入 `mh` 打开菜单，再选择 `4` 安装 / 更新 Mihomo 内核。
 
