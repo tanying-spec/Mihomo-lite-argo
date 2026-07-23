@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.14"
+SCRIPT_VERSION="1.12.4-argo.15"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -15,6 +15,7 @@ CONFIG_BACKUP_FILE="$CONFIG_DIR/config.yaml.previous"
 CONFIG_PENDING_FILE="$CONFIG_DIR/.config-pending"
 DNS_STATE_FILE="$CONFIG_DIR/dns.state"
 DNS_TEST_NAME="${MIHOMO_DNS_TEST_NAME:-www.cloudflare.com}"
+OOM_STATE_FILE="$CONFIG_DIR/oom.state"
 STATE_LOCK_DIR="$CONFIG_DIR/state.lock"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
@@ -5446,6 +5447,45 @@ health_check() {
     ui_error "Mihomo 服务未运行。"
     health_errors=$((health_errors + 1))
   fi
+
+  health_memory_current="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"
+  health_memory_max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+  case "$health_memory_current:$health_memory_max" in
+    *[!0-9:]*|:*) ;;
+    *)
+      health_memory_current_mib=$((health_memory_current / 1048576))
+      health_memory_max_mib=$((health_memory_max / 1048576))
+      if [ "$health_memory_max" -gt 0 ]; then
+        health_memory_percent=$((health_memory_current * 100 / health_memory_max))
+        if [ "$health_memory_percent" -ge 90 ]; then
+          ui_warn "容器内存使用 ${health_memory_current_mib}/${health_memory_max_mib} MiB（${health_memory_percent}%），余量较低。"
+          health_warnings=$((health_warnings + 1))
+        else
+          ui_success "容器内存使用 ${health_memory_current_mib}/${health_memory_max_mib} MiB（${health_memory_percent}%）。"
+        fi
+      fi
+      ;;
+  esac
+
+  health_oom_kill="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+  case "$health_oom_kill" in
+    ''|*[!0-9]*) ;;
+    *)
+      health_previous_oom="$(cat "$OOM_STATE_FILE" 2>/dev/null || true)"
+      case "$health_previous_oom" in ''|*[!0-9]*) health_previous_oom="$health_oom_kill" ;; esac
+      if [ "$health_oom_kill" -gt "$health_previous_oom" ]; then
+        ui_warn "检测到新增 OOM Kill：$((health_oom_kill - health_previous_oom)) 次（累计 $health_oom_kill 次）。"
+        health_warnings=$((health_warnings + 1))
+      elif [ "$health_oom_kill" -gt 0 ] && [ ! -s "$OOM_STATE_FILE" ]; then
+        ui_warn "检测到历史 OOM Kill：累计 $health_oom_kill 次；已记录当前基线。"
+        health_warnings=$((health_warnings + 1))
+      else
+        ui_success "本次检查未发现新增 OOM Kill（累计 $health_oom_kill 次）。"
+      fi
+      printf '%s\n' "$health_oom_kill" > "$OOM_STATE_FILE"
+      chmod 600 "$OOM_STATE_FILE"
+      ;;
+  esac
 
   dns_upstreams="$(configured_dns_servers | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
   if configured_dns_works; then
