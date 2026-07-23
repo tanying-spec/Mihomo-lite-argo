@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.13"
+SCRIPT_VERSION="1.12.4-argo.14"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -4716,6 +4716,23 @@ cloudflared_version_text() {
 }
 
 cloudflared_connection_count() {
+  if command -v nc >/dev/null 2>&1; then
+    metrics_connections="$(
+      printf 'GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' |
+        run_with_timeout 2 nc -w 1 127.0.0.1 20241 2>/dev/null |
+        awk '
+          BEGIN { body = 0 }
+          { sub(/\r$/, "") }
+          body && /^cloudflared_tunnel_ha_connections([{ ]|$)/ { total += $NF; found = 1 }
+          !body && $0 == "" { body = 1 }
+          END { if (found) printf "%d", total }
+        '
+    )"
+    case "$metrics_connections" in
+      ''|*[!0-9]*) ;;
+      *) printf '%s' "$metrics_connections"; return ;;
+    esac
+  fi
   command -v curl >/dev/null 2>&1 || { printf '不可用'; return; }
   metrics_data="$(curl -fsS --max-time 2 "$CLOUDFLARED_METRICS_URL" 2>/dev/null || true)"
   [ -n "$metrics_data" ] || { printf '未知（本地监控不可用）'; return; }
@@ -5015,10 +5032,21 @@ tunnel_local_origin_healthy() {
   IFS='|' read -r _ _ watchdog_port _ watchdog_path watchdog_host _ _ _ <<EOF
 $watchdog_record
 EOF
-  watchdog_status="$(curl --http1.1 -sS -i -N --max-time 4 \
-    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-    -H "Host: $watchdog_host" "http://127.0.0.1:$watchdog_port$watchdog_path" 2>/dev/null | sed -n '1{s/\r$//;p;}' || true)"
+  watchdog_status=""
+  if command -v nc >/dev/null 2>&1; then
+    watchdog_status="$(
+      printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' \
+        "$watchdog_path" "$watchdog_host" |
+        run_with_timeout 3 nc -w 2 127.0.0.1 "$watchdog_port" 2>/dev/null |
+        sed -n '1{s/\r$//;p;q;}' || true
+    )"
+  fi
+  if [ -z "$watchdog_status" ]; then
+    watchdog_status="$(curl --http1.1 -sS -i -N --max-time 4 \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      -H "Host: $watchdog_host" "http://127.0.0.1:$watchdog_port$watchdog_path" 2>/dev/null | sed -n '1{s/\r$//;p;}' || true)"
+  fi
   case "$watchdog_status" in *' 101 '*) return 0 ;; *) return 1 ;; esac
 }
 
