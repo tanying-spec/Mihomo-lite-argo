@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.15"
+SCRIPT_VERSION="1.12.4-argo.16"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -5650,10 +5650,63 @@ uninstall_all() {
   fi
 }
 
+prepare_home_dashboard() {
+  dashboard_mihomo="$(service_status_text)"
+  if [ ! -x "$CLOUDFLARED_BIN" ] && [ ! -s "$CLOUDFLARED_TOKEN_FILE" ]; then
+    dashboard_tunnel="未安装"
+  else
+    dashboard_tunnel="$(cloudflared_status_text)"
+  fi
+  dashboard_connections="-"
+  if cloudflared_service_is_running; then
+    dashboard_connections="$(cloudflared_connection_count)"
+  fi
+
+  dashboard_nodes="$(awk -F'|' 'NF { count++ } END { print count + 0 }' "$NODES_DB" 2>/dev/null)"
+  dashboard_argo="$(awk -F'|' '$1 == "vless-ws" && $7 == "argo" { count++ } END { print count + 0 }' "$NODES_DB" 2>/dev/null)"
+  dashboard_users="关闭"
+  if multi_user_enabled; then
+    dashboard_users="$(awk -F'|' 'NF { count++ } END { print count + 0 }' "$USERS_DB" 2>/dev/null)"
+  fi
+
+  dashboard_memory="未知"
+  dashboard_memory_current="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"
+  dashboard_memory_max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+  case "$dashboard_memory_current:$dashboard_memory_max" in
+    *[!0-9:]*|:*) ;;
+    *)
+      if [ "$dashboard_memory_max" -gt 0 ]; then
+        dashboard_memory="$(awk -v current="$dashboard_memory_current" -v maximum="$dashboard_memory_max" 'BEGIN { printf "%d/%d MiB（%d%%）", current / 1048576, maximum / 1048576, current * 100 / maximum }')"
+      fi
+      ;;
+  esac
+
+  dashboard_oom_current="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+  dashboard_oom_previous="$(cat "$OOM_STATE_FILE" 2>/dev/null || true)"
+  case "$dashboard_oom_current" in
+    ''|*[!0-9]*) dashboard_oom="未知" ;;
+    0) dashboard_oom="0" ;;
+    *)
+      case "$dashboard_oom_previous" in
+        ''|*[!0-9]*) dashboard_oom="历史 ${dashboard_oom_current} 次" ;;
+        *)
+          if [ "$dashboard_oom_current" -gt "$dashboard_oom_previous" ]; then
+            dashboard_oom="新增 $((dashboard_oom_current - dashboard_oom_previous)) 次（累计 ${dashboard_oom_current}）"
+          else
+            dashboard_oom="无新增（累计 ${dashboard_oom_current}）"
+          fi
+          ;;
+      esac
+      ;;
+  esac
+  dashboard_dns="$(configured_dns_servers | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  [ -n "$dashboard_dns" ] || dashboard_dns="未配置"
+}
+
 menu() {
   while true; do
     clear 2>/dev/null || true
-    current_status="$(service_status_text)"
+    prepare_home_dashboard
     multi_user_menu_line=""
     menu_choices="0-11/22/33/44/55/66/88"
     invalid_choices="0-11、22、33、44、55、66 或 88"
@@ -5670,7 +5723,12 @@ ${C_CYAN}====================================================${C_RESET}
   >  ${C_BOLD}原作者${C_RESET}：${C_PURPLE}${SCRIPT_AUTHOR}${C_RESET}
   >  ${C_BOLD}Argo 优化${C_RESET}：${C_PURPLE}${SCRIPT_OPTIMIZER}${C_RESET}
   >  ${C_BOLD}版本${C_RESET}：${C_PURPLE}${SCRIPT_VERSION}${C_RESET}
-  >  ${C_BOLD}状态${C_RESET}：${current_status}
+${C_CYAN}----------------------------------------------------${C_RESET}
+ ${C_YELLOW}[+] 状态概览${C_RESET}
+   Mihomo：${dashboard_mihomo}  |  Tunnel：${dashboard_tunnel}  |  边缘连接：${dashboard_connections}
+   节点：${dashboard_nodes}（Argo ${dashboard_argo}）  |  多用户：${dashboard_users}
+   内存：${dashboard_memory}  |  OOM Kill：${dashboard_oom}
+   DNS：${dashboard_dns}
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_YELLOW}[+] 节点管理${C_RESET}
    ${C_GREEN}1.${C_RESET} 一键生成代理节点
