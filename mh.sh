@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.29"
+SCRIPT_VERSION="1.12.4-argo.30"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -5592,7 +5592,7 @@ run_tunnel_watchdog() {
   fi
   mkdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || return 0
   printf '%s\n' "$$" > "$TUNNEL_WATCHDOG_LOCK/pid"
-  trap 'rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true' 0 HUP INT TERM
+  trap 'rm -f "$TUNNEL_WATCHDOG_LOCK/pid"; rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true' 0 HUP INT TERM
 
   watchdog_failures=0
   watchdog_last_restart=0
@@ -5612,6 +5612,7 @@ run_tunnel_watchdog() {
   if [ "$watchdog_process_ok" = "1" ] && [ "$watchdog_origin_ok" = "1" ] && [ "$watchdog_edge_ok" = "1" ]; then
     printf '0|%s\n' "$watchdog_last_restart" > "$TUNNEL_WATCHDOG_STATE"
     chmod 600 "$TUNNEL_WATCHDOG_STATE"
+    rm -f "$TUNNEL_WATCHDOG_LOCK/pid"
     rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
     trap - 0 HUP INT TERM
     return 0
@@ -5623,11 +5624,13 @@ run_tunnel_watchdog() {
   chmod 600 "$TUNNEL_WATCHDOG_STATE"
 
   if [ "$watchdog_process_ok" = "1" ] && [ "$watchdog_failures" -lt 2 ]; then
+    rm -f "$TUNNEL_WATCHDOG_LOCK/pid"
     rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
     trap - 0 HUP INT TERM
     return 0
   fi
   if [ "$watchdog_now" -gt 0 ] && [ $((watchdog_now - watchdog_last_restart)) -lt 300 ]; then
+    rm -f "$TUNNEL_WATCHDOG_LOCK/pid"
     rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
     trap - 0 HUP INT TERM
     return 0
@@ -5642,6 +5645,7 @@ run_tunnel_watchdog() {
   restart_cloudflared_service >> "$TUNNEL_WATCHDOG_LOG" 2>&1 || true
   printf '0|%s\n' "$watchdog_now" > "$TUNNEL_WATCHDOG_STATE"
   chmod 600 "$TUNNEL_WATCHDOG_STATE"
+  rm -f "$TUNNEL_WATCHDOG_LOCK/pid"
   rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
   trap - 0 HUP INT TERM
 }
@@ -5668,7 +5672,7 @@ disable_tunnel_watchdog() {
     rm -f "$tmp_file"
   fi
   rm -f "$TUNNEL_WATCHDOG_STATE"
-  rmdir "$TUNNEL_WATCHDOG_LOCK" 2>/dev/null || true
+  rm -rf "$TUNNEL_WATCHDOG_LOCK"
   ui_success "Tunnel 自动恢复已关闭。"
 }
 
