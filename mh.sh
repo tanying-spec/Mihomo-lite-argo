@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.20"
+SCRIPT_VERSION="1.12.4-argo.21"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -5920,6 +5920,123 @@ health_check() {
   return 1
 }
 
+generate_diagnostic_report() {
+  need_root
+  ensure_installed
+  screen_title "生成脱敏诊断报告"
+
+  report_timestamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || printf 'unknown')"
+  report_file="/tmp/mihomo-diagnostic-${report_timestamp}.txt"
+  report_os="$({ . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-${ID:-未知}}"; } 2>/dev/null || printf '未知')"
+  report_kernel="$(uname -r 2>/dev/null || printf '未知')"
+  report_arch="$(uname -m 2>/dev/null || printf '未知')"
+  report_cpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '未知')"
+  report_memory_current="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"
+  report_memory_max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+  case "$report_memory_current" in ''|*[!0-9]*) report_memory_current_text="未知" ;; *) report_memory_current_text="$((report_memory_current / 1048576)) MiB" ;; esac
+  case "$report_memory_max" in ''|*[!0-9]*) report_memory_max_text="${report_memory_max:-未知}" ;; *) report_memory_max_text="$((report_memory_max / 1048576)) MiB" ;; esac
+  report_oom="$(awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+  [ -n "$report_oom" ] || report_oom="未知"
+
+  report_mihomo_version="$($BIN_PATH -v 2>/dev/null | sed -n '1p')"
+  [ -n "$report_mihomo_version" ] || report_mihomo_version="未知"
+  if "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$CONFIG_FILE" >/dev/null 2>&1; then report_config="正常"; else report_config="失败"; fi
+  report_mihomo_status="$(service_status_text)"
+  report_tunnel_status="$(cloudflared_status_text)"
+  report_tunnel_version="$(cloudflared_version_text)"
+  report_tunnel_connections="0"
+  cloudflared_service_is_running && report_tunnel_connections="$(cloudflared_connection_count)"
+  [ -s "$CLOUDFLARED_TOKEN_FILE" ] && report_tunnel_config="已配置" || report_tunnel_config="未配置"
+  report_token_mode="$(stat -c '%a' "$CLOUDFLARED_TOKEN_FILE" 2>/dev/null || printf '无')"
+
+  report_node_summary="$(awk -F'|' '
+    NF { total++; count[$1]++; if ($1 == "vless-ws") mode[$7]++ }
+    END {
+      printf "总数=%d, Reality=%d, Hysteria2=%d, AnyTLS=%d, VLESS-WS=%d", total+0, count["vless-reality"]+0, count["hysteria2"]+0, count["anytls"]+0, count["vless-ws"]+0
+      if (count["vless-ws"] > 0) printf " (direct=%d, cdn=%d, argo=%d)", mode["direct"]+0, mode["cdn"]+0, mode["argo"]+0
+    }
+  ' "$NODES_DB" 2>/dev/null)"
+  report_expected_listeners="$(awk -F'|' 'NF { count++ } END { print count + 0 }' "$NODES_DB" 2>/dev/null)"
+  report_active_listeners=0
+  report_wrong_owner=0
+  while IFS='|' read -r report_proto report_name report_port report_rest; do
+    case "$report_port" in ''|*[!0-9]*) continue ;; esac
+    system_port_in_use "$report_port" && report_active_listeners=$((report_active_listeners + 1))
+    if command -v ss >/dev/null 2>&1 && system_port_in_use "$report_port" && ! port_owned_by_process "$report_port" mihomo; then
+      report_wrong_owner=$((report_wrong_owner + 1))
+    fi
+  done < "$NODES_DB"
+
+  report_dns_count="$(configured_dns_servers | awk 'NF { count++ } END { print count + 0 }')"
+  if configured_dns_works; then report_dns_status="可解析"; else report_dns_status="不可用"; fi
+  report_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
+  report_retrans="$(network_metric_value TcpRetransSegs)"
+  report_timeouts="$(network_metric_value TcpExtTCPTimeouts)"
+  report_udp_errors="$(network_metric_value UdpRcvbufErrors)"
+  report_listen_drops="$(network_metric_value TcpExtListenDrops)"
+
+  report_runtime="未保存自定义参数"
+  if [ -s "$RUNTIME_ENV_FILE" ]; then
+    report_runtime="$(awk -F= '
+      $1 == "MIHOMO_GOMEMLIMIT" || $1 == "MIHOMO_GOGC" || $1 == "MIHOMO_GOMAXPROCS" { printf "%s=%s ", $1, $2 }
+    ' "$RUNTIME_ENV_FILE" | sed 's/[[:space:]]*$//')"
+    [ -n "$report_runtime" ] || report_runtime="未保存自定义参数"
+  fi
+  report_sysctl="未应用"
+  if [ -s "$SYSCTL_CONF_FILE" ]; then
+    report_sysctl="$(awk -F= '!/^[[:space:]]*#/ && NF >= 2 { gsub(/[[:space:]]/, "", $1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); printf "%s=%s ", $1, $2 }' "$SYSCTL_CONF_FILE" | sed 's/[[:space:]]*$//')"
+    [ -n "$report_sysctl" ] || report_sysctl="未应用"
+  fi
+
+  cat > "$report_file" <<EOF
+Mihomo Lite 脱敏诊断报告
+生成时间：$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf '未知')
+隐私说明：未包含公网 IP、域名、节点名称、端口明细、UUID、密码、Token、证书路径、WebSocket Path 或节点链接。
+
+[版本与系统]
+管理脚本：$SCRIPT_VERSION
+Mihomo：$report_mihomo_version
+cloudflared：$report_tunnel_version
+系统：$report_os
+内核/架构：$report_kernel / $report_arch
+服务管理：$(service_manager)
+可用 CPU：$report_cpu
+内存：$report_memory_current_text / $report_memory_max_text
+OOM Kill 累计：$report_oom
+
+[服务状态]
+Mihomo：$report_mihomo_status
+配置自检：$report_config
+Tunnel：$report_tunnel_status
+Tunnel 配置：$report_tunnel_config（Token 内容已隐藏，权限=$report_token_mode）
+Tunnel 活跃连接：$report_tunnel_connections
+
+[节点状态]
+$report_node_summary
+监听：$report_active_listeners/$report_expected_listeners
+非 Mihomo 占用：$report_wrong_owner
+
+[DNS 与网络]
+DNS 上游数量：$report_dns_count（地址已隐藏）
+DNS 状态：$report_dns_status
+TCP 拥塞控制：$report_cc
+TCP 重传累计：$report_retrans
+TCP 超时累计：$report_timeouts
+UDP 缓冲错误累计：$report_udp_errors
+监听丢弃累计：$report_listen_drops
+
+[已应用调优]
+运行参数：$report_runtime
+网络参数：$report_sysctl
+EOF
+  chmod 600 "$report_file"
+
+  cat "$report_file"
+  ui_dash
+  ui_success "报告已保存：$report_file"
+  ui_warn "报告已经脱敏，但分享前仍建议快速浏览一次。"
+}
+
 uninstall_all() {
   need_root
   screen_title "彻底卸载脚本"
@@ -6024,12 +6141,12 @@ menu() {
     clear 2>/dev/null || true
     prepare_home_dashboard
     multi_user_menu_line=""
-    menu_choices="0-11/22/33/44/55/66/88"
-    invalid_choices="0-11、22、33、44、55、66 或 88"
+    menu_choices="0-12/22/33/44/55/66/88"
+    invalid_choices="0-12、22、33、44、55、66 或 88"
     if multi_user_enabled; then
       multi_user_menu_line="   ${C_GREEN}77.${C_RESET} 多用户管理面板"
-      menu_choices="0-11/22/33/44/55/66/77/88"
-      invalid_choices="0-11、22、33、44、55、66、77 或 88"
+      menu_choices="0-12/22/33/44/55/66/77/88"
+      invalid_choices="0-12、22、33、44、55、66、77 或 88"
     fi
     
     cat <<EOF
@@ -6062,6 +6179,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}8.${C_RESET} 重启 Mihomo 服务
    ${C_GREEN}9.${C_RESET} 查看服务实时日志
    ${C_GREEN}11.${C_RESET} 一键系统健康检查
+   ${C_GREEN}12.${C_RESET} 生成脱敏诊断报告
 
   ${C_YELLOW}[+] 其他功能${C_RESET}
    ${C_GREEN}22.${C_RESET} 一键生成 Reality + Hysteria2 + AnyTLS
@@ -6090,6 +6208,7 @@ EOF
       9) show_logs ;;
       10) version_rollback_menu; pause ;;
       11) health_check; pause ;;
+      12) generate_diagnostic_report; pause ;;
       22) add_combo_nodes; pause ;;
       33) rename_all_nodes; pause ;;
       44) performance_tuning_menu; pause ;;
@@ -6139,6 +6258,7 @@ case "${1:-}" in
   update) update_script ;;
   rollback) version_rollback_menu ;;
   check|health|doctor) health_check ;;
+  report|diagnostic|12) generate_diagnostic_report ;;
   uninstall) uninstall_all ;;
   *) menu ;;
 esac
