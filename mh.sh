@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.25"
+SCRIPT_VERSION="1.12.4-argo.26"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -1950,11 +1950,24 @@ service_is_running() {
   esac
 }
 
+mihomo_internal_ports_ready() {
+  for ready_port in 7890 9090 1053; do
+    system_port_in_use "$ready_port" || return 1
+    if command -v ss >/dev/null 2>&1 && ! port_owned_by_process "$ready_port" mihomo; then
+      return 1
+    fi
+  done
+}
+
 wait_service_running() {
   wait_service_count=0
+  wait_service_streak=0
   while [ "$wait_service_count" -lt 10 ]; do
-    if service_is_running && system_port_in_use 7890 && system_port_in_use 9090 && system_port_in_use 1053; then
-      return 0
+    if service_is_running && mihomo_internal_ports_ready; then
+      wait_service_streak=$((wait_service_streak + 1))
+      [ "$wait_service_streak" -ge 2 ] && return 0
+    else
+      wait_service_streak=0
     fi
     sleep 1
     wait_service_count=$((wait_service_count + 1))
