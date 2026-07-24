@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.26"
+SCRIPT_VERSION="1.12.4-argo.27"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -5969,6 +5969,35 @@ health_check() {
   pending_rotation_count="$(awk 'NF { count++ } END { print count + 0 }' "$CREDENTIAL_ROTATIONS_DB" 2>/dev/null)"
   if [ "${pending_rotation_count:-0}" -gt 0 ]; then
     ui_warn "有 $pending_rotation_count 个节点正在进行凭据轮换；确认新链接后请完成或取消轮换。"
+    health_warnings=$((health_warnings + 1))
+  fi
+
+  sensitive_permission_issues=0
+  sensitive_files="${CONFIG_FILE}
+${NODES_DB}
+${USERS_DB}
+${CREDENTIAL_ROTATIONS_DB}
+${CONFIG_DIR}/controller.secret"
+  if [ -s "$NODES_DB" ]; then
+    sensitive_key_files="$(awk -F'|' '$1 == "hysteria2" || $1 == "anytls" { print $7 }' "$NODES_DB" 2>/dev/null)"
+    [ -n "$sensitive_key_files" ] && sensitive_files="${sensitive_files}
+${sensitive_key_files}"
+  fi
+  while IFS= read -r sensitive_file; do
+    [ -e "$sensitive_file" ] || continue
+    sensitive_mode="$(stat -c '%a' "$sensitive_file" 2>/dev/null || true)"
+    sensitive_owner="$(stat -c '%u' "$sensitive_file" 2>/dev/null || true)"
+    if [ "$sensitive_mode" != "600" ] || [ "$sensitive_owner" != "0" ]; then
+      sensitive_permission_issues=$((sensitive_permission_issues + 1))
+      ui_warn "权限异常：$sensitive_file（mode=${sensitive_mode:-未知}, uid=${sensitive_owner:-未知}）；请执行 chmod 600 并设为 root 所有。"
+    fi
+  done <<EOF
+$sensitive_files
+EOF
+  if [ "$sensitive_permission_issues" -eq 0 ]; then
+    ui_success "敏感配置文件均属于 root，权限为 600。"
+  else
+    ui_warn "发现 $sensitive_permission_issues 个敏感配置文件权限不安全；现有节点仍会运行，但凭据可能被其他本地用户读取。"
     health_warnings=$((health_warnings + 1))
   fi
 
