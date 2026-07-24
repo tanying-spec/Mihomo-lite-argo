@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.27"
+SCRIPT_VERSION="1.12.4-argo.28"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -213,8 +213,9 @@ sha256_file() {
 verify_remote_checksum() {
   checksum_url="$1"
   checksum_target="$2"
+  checksum_sidecar_url="${3:-${checksum_url}.sha256}"
   checksum_tmp="$(make_temp /tmp/mh-checksum.XXXXXX)"
-  if ! curl -fsSL --max-time 15 "${checksum_url}.sha256" -o "$checksum_tmp"; then
+  if ! curl -fsSL --max-time 15 "$checksum_sidecar_url" -o "$checksum_tmp"; then
     rm -f "$checksum_tmp"
     ui_warn "上游未提供 SHA-256 sidecar，继续使用格式与可执行性检查。"
     return 2
@@ -5876,12 +5877,31 @@ update_script() {
   tmp_file="$(make_temp /tmp/mh-update.XXXXXX)"
   ui_warn "更新来源：$SCRIPT_RAW_URL"
   ui_section "下载最新脚本"
-  curl -fsSL "$SCRIPT_RAW_URL" -o "$tmp_file" || {
+  script_fetch_url="$SCRIPT_RAW_URL"
+  checksum_fetch_url="${SCRIPT_RAW_URL}.sha256"
+  case "$SCRIPT_RAW_URL" in
+    http://*|https://*)
+      update_nonce="$(date +%s 2>/dev/null || printf 0)"
+      case "$SCRIPT_RAW_URL" in
+        *\?*)
+          script_url_base="${SCRIPT_RAW_URL%%\?*}"
+          script_url_query="${SCRIPT_RAW_URL#*\?}"
+          script_fetch_url="${SCRIPT_RAW_URL}&mh=${update_nonce}"
+          checksum_fetch_url="${script_url_base}.sha256?${script_url_query}&mh=${update_nonce}"
+          ;;
+        *)
+          script_fetch_url="${SCRIPT_RAW_URL}?mh=${update_nonce}"
+          checksum_fetch_url="${SCRIPT_RAW_URL}.sha256?mh=${update_nonce}"
+          ;;
+      esac
+      ;;
+  esac
+  curl -fsSL "$script_fetch_url" -o "$tmp_file" || {
     rm -f "$tmp_file"
     ui_error "更新失败：无法下载最新脚本。"
     return 1
   }
-  verify_remote_checksum "$SCRIPT_RAW_URL" "$tmp_file"
+  verify_remote_checksum "$SCRIPT_RAW_URL" "$tmp_file" "$checksum_fetch_url"
   verify_result=$?
   [ "$verify_result" -ne 1 ] || { rm -f "$tmp_file"; return 1; }
 

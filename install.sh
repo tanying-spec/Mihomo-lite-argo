@@ -58,14 +58,23 @@ if [ -n "$LOCAL_SCRIPT" ]; then
   fi
   cp "$LOCAL_SCRIPT" "$tmp_file"
 else
-  curl -fsSL "$RAW_BASE/mh.sh" -o "$tmp_file" || {
+  script_url="$RAW_BASE/mh.sh"
+  checksum_url="$RAW_BASE/mh.sh.sha256"
+  case "$RAW_BASE" in
+    http://*|https://*)
+      install_nonce="$(date +%s 2>/dev/null || printf 0)"
+      script_url="${script_url}?mh=${install_nonce}"
+      checksum_url="${checksum_url}?mh=${install_nonce}"
+      ;;
+  esac
+  curl -fsSL "$script_url" -o "$tmp_file" || {
     rm -f "$tmp_file"
     red "下载 mh.sh 失败。请检查网络、DNS 或 GitHub 访问是否正常。"
     red "如果同时看到 curl: (23)，通常是管道右侧命令提前退出，并非磁盘写入故障。"
     exit 1
   }
   checksum_file="$(make_temp /tmp/mh-install-sha.XXXXXX)"
-  if curl -fsSL "$RAW_BASE/mh.sh.sha256" -o "$checksum_file"; then
+  if curl -fsSL "$checksum_url" -o "$checksum_file"; then
     expected="$(awk 'NR == 1 { print $1 }' "$checksum_file")"
     if command -v sha256sum >/dev/null 2>&1; then
       actual="$(sha256sum "$tmp_file" | awk '{ print $1 }')"
