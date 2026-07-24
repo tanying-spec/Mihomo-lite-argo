@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.23"
+SCRIPT_VERSION="1.12.4-argo.24"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -2061,6 +2061,24 @@ install_core() {
     ui_error "下载的 Mihomo 内核无法运行，已取消安装。"
     return 1
   fi
+  core_rollback_file=""
+  previous_backup_file=""
+  if [ -x "$BIN_PATH" ]; then
+    core_rollback_file="$(make_temp /tmp/mihomo-install-rollback.XXXXXX)"
+    if ! cp "$BIN_PATH" "$core_rollback_file"; then
+      rm -f "$tmp_file" "$bin_tmp" "$core_rollback_file"
+      ui_error "无法保存当前 Mihomo 内核，已取消安装。"
+      return 1
+    fi
+  fi
+  if [ -x "$BIN_BACKUP_PATH" ]; then
+    previous_backup_file="$(make_temp /tmp/mihomo-backup-rollback.XXXXXX)"
+    if ! cp "$BIN_BACKUP_PATH" "$previous_backup_file"; then
+      rm -f "$tmp_file" "$bin_tmp" "$core_rollback_file" "$previous_backup_file"
+      ui_error "无法保存上一版 Mihomo 备份，已取消安装。"
+      return 1
+    fi
+  fi
   if [ -x "$BIN_PATH" ]; then
     cp "$BIN_PATH" "$BIN_BACKUP_PATH"
     chmod 755 "$BIN_BACKUP_PATH"
@@ -2076,12 +2094,20 @@ install_core() {
     chmod 600 "$USERS_DB"
   fi
   if ! render_config; then
-    if [ -x "$BIN_BACKUP_PATH" ]; then
-      cp "$BIN_BACKUP_PATH" "$BIN_PATH"
-      ui_warn "新内核无法加载现有配置，已恢复上一版本。"
+    if [ -n "$core_rollback_file" ] && [ -f "$core_rollback_file" ]; then
+      cp "$core_rollback_file" "$BIN_PATH"
+      chmod 755 "$BIN_PATH"
+      ui_warn "新内核无法加载现有配置，已恢复安装前版本。"
     else
       rm -f "$BIN_PATH"
     fi
+    if [ -n "$previous_backup_file" ] && [ -f "$previous_backup_file" ]; then
+      cp "$previous_backup_file" "$BIN_BACKUP_PATH"
+      chmod 755 "$BIN_BACKUP_PATH"
+    else
+      rm -f "$BIN_BACKUP_PATH"
+    fi
+    rm -f "$core_rollback_file" "$previous_backup_file"
     return 1
   fi
 
@@ -2097,14 +2123,25 @@ install_core() {
   esac
 
   if [ "${core_install_failed:-0}" = "1" ]; then
-    if [ -x "$BIN_BACKUP_PATH" ]; then
-      cp "$BIN_BACKUP_PATH" "$BIN_PATH"
+    if [ -n "$core_rollback_file" ] && [ -f "$core_rollback_file" ]; then
+      cp "$core_rollback_file" "$BIN_PATH"
+      chmod 755 "$BIN_PATH"
       restart_service >/dev/null 2>&1 || true
-      ui_warn "新内核启动失败，已恢复上一版本。"
+      ui_warn "新内核启动失败，已恢复安装前版本。"
+    else
+      rm -f "$BIN_PATH"
     fi
+    if [ -n "$previous_backup_file" ] && [ -f "$previous_backup_file" ]; then
+      cp "$previous_backup_file" "$BIN_BACKUP_PATH"
+      chmod 755 "$BIN_BACKUP_PATH"
+    else
+      rm -f "$BIN_BACKUP_PATH"
+    fi
+    rm -f "$core_rollback_file" "$previous_backup_file"
     return 1
   fi
 
+  rm -f "$core_rollback_file" "$previous_backup_file"
   ui_success "mihomo 内核安装完成，服务已启动。"
 }
 
