@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.24"
+SCRIPT_VERSION="1.12.4-argo.25"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -3540,6 +3540,25 @@ remove_pending_credential_record() {
   chmod 600 "$CREDENTIAL_ROTATIONS_DB"
 }
 
+cleanup_deleted_node_files() {
+  cleanup_file_list="$1"
+  [ -n "$cleanup_file_list" ] || return 0
+  while IFS= read -r cleanup_path; do
+    [ -n "$cleanup_path" ] || continue
+    case "$cleanup_path" in
+      "$CONFIG_DIR"/*) ;;
+      *) continue ;;
+    esac
+    [ -f "$cleanup_path" ] || continue
+    if awk -F'|' -v path="$cleanup_path" '$6 == path || $7 == path { found = 1 } END { exit found ? 0 : 1 }' "$NODES_DB" 2>/dev/null; then
+      continue
+    fi
+    rm -f "$cleanup_path"
+  done <<EOF
+$cleanup_file_list
+EOF
+}
+
 print_rotated_node_link() {
   rotated_credential="$1"
   print_node_link "$proto" "$node_name" "$node_port" "$rotated_credential" "$value2" "$value3" "$value4" "$value5" "$value6"
@@ -3684,6 +3703,7 @@ delete_node() {
         return 0
         ;;
     esac
+    deleted_tls_files="$(awk -F'|' '$1 == "hysteria2" || $1 == "anytls" { print $6; print $7 }' "$NODES_DB" 2>/dev/null)"
     state_transaction_begin || return 1
     : > "$NODES_DB"
     chmod 600 "$NODES_DB"
@@ -3695,6 +3715,7 @@ delete_node() {
       reset_user_traffic_snapshot
     fi
     state_transaction_apply || return 1
+    cleanup_deleted_node_files "$deleted_tls_files"
     refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
     ui_success "所有节点已删除，服务已重启。"
     return 0
@@ -3730,11 +3751,18 @@ delete_node() {
   chmod 600 "$NODES_DB"
   deleted_proto="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $1 }')"
   deleted_credential="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $4 }')"
+  deleted_tls_files=""
+  case "$deleted_proto" in
+    hysteria2|anytls)
+      deleted_tls_files="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $6; print $7 }')"
+      ;;
+  esac
   remove_pending_credential_record "$deleted_proto" "$deleted_credential"
   if multi_user_enabled; then
     remove_users_for_node "$deleted"
   fi
   state_transaction_apply || return 1
+  cleanup_deleted_node_files "$deleted_tls_files"
   refresh_user_traffic_rules_if_available >/dev/null 2>&1 || true
   ui_success "节点 $deleted 已删除，服务已重启。"
 }
