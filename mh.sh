@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.22"
+SCRIPT_VERSION="1.12.4-argo.23"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -2550,6 +2550,18 @@ append_node() {
 
 state_transaction_begin() {
   mkdir -p "$CONFIG_DIR"
+  if [ ! -d "$STATE_LOCK_DIR" ]; then
+    orphan_tx_dir="$(ls -td "$CONFIG_DIR"/.state-tx.* 2>/dev/null | sed -n '1p')"
+    case "$orphan_tx_dir" in
+      "$CONFIG_DIR"/.state-tx.*)
+        STATE_TX_DIR="$orphan_tx_dir"
+        state_transaction_restore_files
+        rm -rf "$CONFIG_DIR"/.state-tx.*
+        STATE_TX_DIR=""
+        ui_warn "检测到未关联锁的配置快照，已自动恢复上次未完成的操作。"
+        ;;
+    esac
+  fi
   if ! mkdir "$STATE_LOCK_DIR" 2>/dev/null; then
     state_lock_pid="$(cat "$STATE_LOCK_DIR/pid" 2>/dev/null || true)"
     case "$state_lock_pid" in ''|*[!0-9]*) state_lock_alive=0 ;; *) if kill -0 "$state_lock_pid" 2>/dev/null; then state_lock_alive=1; else state_lock_alive=0; fi ;; esac
@@ -2571,7 +2583,12 @@ state_transaction_begin() {
     rm -rf "$STATE_LOCK_DIR"
     mkdir "$STATE_LOCK_DIR" 2>/dev/null || { ui_error "无法取得配置修改锁。"; return 1; }
   fi
-  printf '%s\n' "$$" > "$STATE_LOCK_DIR/pid"
+  state_current_pid="$$"
+  if [ -r /proc/self/stat ]; then
+    IFS=' ' read -r state_proc_pid state_proc_rest < /proc/self/stat 2>/dev/null || true
+    case "$state_proc_pid" in ''|*[!0-9]*) ;; *) state_current_pid="$state_proc_pid" ;; esac
+  fi
+  printf '%s\n' "$state_current_pid" > "$STATE_LOCK_DIR/pid"
   STATE_TX_DIR="$(mktemp -d "$CONFIG_DIR/.state-tx.XXXXXX" 2>/dev/null)" || {
     rm -rf "$STATE_LOCK_DIR"
     ui_error "无法创建状态事务目录。"
