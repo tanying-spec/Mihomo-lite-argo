@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.19"
+SCRIPT_VERSION="1.12.4-argo.20"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -2168,6 +2168,24 @@ port_owned_by_process() {
   '
 }
 
+protocol_port_in_use() {
+  transport="$1"
+  check_port="$2"
+  command -v ss >/dev/null 2>&1 || return 2
+  case "$transport" in
+    tcp) ss -lnt 2>/dev/null ;;
+    udp) ss -lnu 2>/dev/null ;;
+    *) return 2 ;;
+  esac | awk -v p="$check_port" '
+    NR > 1 {
+      address = $4
+      sub(/^.*:/, "", address)
+      if (address == p) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
 port_bound_to_loopback() {
   loop_port="$1"
   command -v ss >/dev/null 2>&1 || return 2
@@ -2765,6 +2783,119 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
 EOF
 }
 
+verify_node_runtime() {
+  verify_proto="$1"
+  verify_name="$2"
+  verify_port="$3"
+  verify_value1="${4:-}"
+  verify_value2="${5:-}"
+  verify_value3="${6:-}"
+  verify_value4="${7:-}"
+  verify_value5="${8:-}"
+  verify_value6="${9:-}"
+  verify_errors=0
+  verify_warnings=0
+
+  ui_section "自动检测：$verify_name"
+  if [ -x "$BIN_PATH" ] && "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$CONFIG_FILE" >/dev/null 2>&1; then
+    ui_success "配置有效。"
+  else
+    ui_error "配置自检失败；现有服务可能仍在使用修改前的配置。"
+    verify_errors=$((verify_errors + 1))
+  fi
+
+  if service_is_running; then
+    ui_success "Mihomo 正在运行。"
+  else
+    ui_error "Mihomo 未运行，节点当前无法使用。"
+    verify_errors=$((verify_errors + 1))
+  fi
+
+  verify_transport="tcp"
+  [ "$verify_proto" = "hysteria2" ] && verify_transport="udp"
+  [ "$verify_transport" = "tcp" ] && verify_transport_label="TCP" || verify_transport_label="UDP"
+  if protocol_port_in_use "$verify_transport" "$verify_port"; then
+    ui_success "$verify_transport_label 端口 $verify_port 已监听。"
+  else
+    verify_port_result=$?
+    if [ "$verify_port_result" -eq 2 ] && system_port_in_use "$verify_port"; then
+      ui_success "端口 $verify_port 已监听（系统工具无法区分 TCP/UDP）。"
+    else
+      ui_error "$verify_transport_label 端口 $verify_port 未监听。"
+      verify_errors=$((verify_errors + 1))
+    fi
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    if port_owned_by_process "$verify_port" "mihomo"; then
+      ui_success "端口由 Mihomo 持有。"
+    else
+      ui_error "端口不是由 Mihomo 持有，可能存在端口冲突。"
+      verify_errors=$((verify_errors + 1))
+    fi
+  fi
+
+  case "$verify_proto" in
+    vless-ws)
+      verify_ws_host="${verify_value3:-127.0.0.1}"
+      if websocket_probe "http://127.0.0.1:$verify_port$verify_value2" "$verify_ws_host"; then
+        :
+      else
+        verify_errors=$((verify_errors + 1))
+      fi
+      case "$verify_value4" in
+        argo)
+          if cloudflared_service_is_running; then
+            verify_cf_connections="$(cloudflared_connection_count)"
+            if [ "${verify_cf_connections:-0}" -gt 0 ] 2>/dev/null; then
+              ui_success "Tunnel 在线，活跃连接：$verify_cf_connections。"
+              if websocket_probe "https://$verify_value3:443$verify_value2" "$verify_value3"; then
+                ui_success "公网 Tunnel 路由可用。"
+              else
+                ui_warn "本地节点正常，但公网 Tunnel 路由尚不可用；请检查公共主机名和路由服务地址。"
+                verify_warnings=$((verify_warnings + 1))
+              fi
+            else
+              ui_warn "cloudflared 已运行，但暂时没有活跃边缘连接。"
+              verify_warnings=$((verify_warnings + 1))
+            fi
+          else
+            ui_warn "本地节点正常，但 Tunnel 尚未运行；配置 Tunnel 后再检测公网入口。"
+            verify_warnings=$((verify_warnings + 1))
+          fi
+          ;;
+        cdn)
+          if websocket_probe "https://$verify_value3:$verify_value6$verify_value2" "$verify_value3"; then
+            ui_success "Cloudflare CDN 公网入口可用。"
+          else
+            ui_warn "本地节点正常，但 CDN 公网入口尚不可用；请检查 DNS、端口和 Cloudflare 代理状态。"
+            verify_warnings=$((verify_warnings + 1))
+          fi
+          ;;
+        direct)
+          ui_warn "本地 WebSocket 已验证；公网 NAT 映射需要从另一台设备测试。"
+          verify_warnings=$((verify_warnings + 1))
+          ;;
+      esac
+      ;;
+    vless-reality|anytls)
+      ui_warn "服务端 TCP 监听正常；完整认证需要在客户端导入节点后验证。"
+      verify_warnings=$((verify_warnings + 1))
+      ;;
+    hysteria2)
+      ui_warn "服务端 UDP 监听正常；完整认证与速度需要在客户端导入节点后验证。"
+      verify_warnings=$((verify_warnings + 1))
+      ;;
+  esac
+
+  if [ "$verify_errors" -eq 0 ]; then
+    ui_success "检测完成：服务端未发现故障，$verify_warnings 项需要外部条件确认。"
+    return 0
+  fi
+  ui_error "检测完成：发现 $verify_errors 个故障，$verify_warnings 个提示；节点记录已保留，便于修复后复测。"
+  return 1
+}
+
 add_vless_reality_node() {
   screen_title "创建 VLESS + Reality 节点"
   prompt_node_name vless-reality || return 1
@@ -2782,9 +2913,10 @@ add_vless_reality_node() {
   private_key="${key_pair%%|*}"
   public_key="${key_pair#*|}"
   short_id="$(rand_hex 8)"
-  append_node "vless-reality|$node_name|$node_port|$node_uuid|$sni|$dest|$private_key|$public_key|$short_id"
+  append_node "vless-reality|$node_name|$node_port|$node_uuid|$sni|$dest|$private_key|$public_key|$short_id" || return 1
   ui_success "VLESS + Reality 节点已生成并重启服务。"
   print_node_link vless-reality "$node_name" "$node_port" "$node_uuid" "$sni" "$dest" "$private_key" "$public_key" "$short_id"
+  verify_node_runtime vless-reality "$node_name" "$node_port" "$node_uuid" "$sni" "$dest" "$private_key" "$public_key" "$short_id" || true
 }
 
 add_hysteria2_node() {
@@ -2815,9 +2947,10 @@ add_hysteria2_node() {
   cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || { ui_error "Hysteria2 证书生成失败。"; return 1; }
   cert_file="${cert_pair%%|*}"
   key_file="${cert_pair#*|}"
-  append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file|$salamander_password|"
+  append_node "hysteria2|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file|$salamander_password|" || return 1
   ui_success "Hysteria2 节点已生成并重启服务。"
   print_node_link hysteria2 "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "$salamander_password" ""
+  verify_node_runtime hysteria2 "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "$salamander_password" "" || true
 }
 
 add_anytls_node() {
@@ -2835,9 +2968,10 @@ add_anytls_node() {
   cert_pair="$(ensure_tls_cert "$node_name" "$sni")" || { ui_error "AnyTLS 证书生成失败。"; return 1; }
   cert_file="${cert_pair%%|*}"
   key_file="${cert_pair#*|}"
-  append_node "anytls|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||"
+  append_node "anytls|$node_name|$node_port|$node_password|$sni|$cert_file|$key_file||" || return 1
   ui_success "AnyTLS 节点已生成并重启服务。"
   print_node_link anytls "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "" ""
+  verify_node_runtime anytls "$node_name" "$node_port" "$node_password" "$sni" "$cert_file" "$key_file" "" "" || true
 }
 
 add_vless_ws_node() {
@@ -2933,13 +3067,14 @@ EOF
     *) ws_path="/$ws_path" ;;
   esac
   node_uuid="$(new_uuid)"
-  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path|$ws_host|$ws_mode|$ws_entry_address|$ws_entry_port"
+  append_node "vless-ws|$node_name|$node_port|$node_uuid|$ws_path|$ws_host|$ws_mode|$ws_entry_address|$ws_entry_port" || return 1
   ui_success "VLESS + WS 节点已生成并重启服务。"
   if [ "$ws_mode" = "argo" ]; then
     ui_warn "Tunnel 路由服务请填写：http://127.0.0.1:$node_port"
     ui_warn "公共主机名：$ws_host（不要手动创建 A/AAAA；Tunnel 会自动创建 CNAME）"
   fi
   print_node_link vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "$ws_mode" "$ws_entry_address" "$ws_entry_port"
+  verify_node_runtime vless-ws "$node_name" "$node_port" "$node_uuid" "$ws_path" "$ws_host" "$ws_mode" "$ws_entry_address" "$ws_entry_port" || true
 }
 
 add_combo_nodes() {
@@ -2984,6 +3119,9 @@ add_combo_nodes() {
   print_node_link vless-reality "$reality_name" "$reality_port" "$reality_uuid" "$sni" "$reality_dest" "$reality_private_key" "$reality_public_key" "$reality_short_id"
   print_node_link hysteria2 "$hy2_name" "$hy2_port" "$hy2_password" "$sni" "$hy2_cert_file" "$hy2_key_file" "" ""
   print_node_link anytls "$anytls_name" "$anytls_port" "$anytls_password" "$sni" "$anytls_cert_file" "$anytls_key_file" "" ""
+  verify_node_runtime vless-reality "$reality_name" "$reality_port" "$reality_uuid" "$sni" "$reality_dest" "$reality_private_key" "$reality_public_key" "$reality_short_id" || true
+  verify_node_runtime hysteria2 "$hy2_name" "$hy2_port" "$hy2_password" "$sni" "$hy2_cert_file" "$hy2_key_file" "" "" || true
+  verify_node_runtime anytls "$anytls_name" "$anytls_port" "$anytls_password" "$sni" "$anytls_cert_file" "$anytls_key_file" "" "" || true
 }
 
 rename_all_nodes() {
@@ -3163,7 +3301,7 @@ list_nodes() {
     return 1
   fi
 
-  ui_section "可删除节点"
+  ui_section "节点列表"
   i=1
   while IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6; do
     [ -n "$proto" ] || continue
@@ -3314,15 +3452,28 @@ node_management_menu() {
   screen_title "节点管理"
   printf ' %s1.%s 编辑节点\n' "$C_GREEN" "$C_RESET"
   printf ' %s2.%s 删除节点\n' "$C_GREEN" "$C_RESET"
+  printf ' %s3.%s 检测节点是否可用\n' "$C_GREEN" "$C_RESET"
   printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
-  ui_prompt "请输入数字选择 (0-2)："
+  ui_prompt "请输入数字选择 (0-3)："
   read -r node_manage_choice || true
   case "$node_manage_choice" in
     1) edit_node ;;
     2) delete_node ;;
+    3) test_existing_node ;;
     0) return 0 ;;
     *) ui_error "无效选择。"; return 1 ;;
   esac
+}
+
+test_existing_node() {
+  need_root
+  ensure_installed
+  screen_title "检测节点是否可用"
+  select_node || return 0
+  IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6 <<EOF
+$SELECTED_NODE_RECORD
+EOF
+  verify_node_runtime "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6"
 }
 
 delete_node() {
@@ -5980,6 +6131,7 @@ case "${1:-}" in
   users|user|multi-user|77) multi_user_panel ;;
   list|nodes) show_all_nodes ;;
   config) show_config ;;
+  test-node|node-test) test_existing_node ;;
   delete|del|remove) delete_node ;;
   restart) need_root; ensure_installed; restart_service ;;
   dns-migrate|dns-repair) need_root; ensure_installed; dns_preflight_repair && restart_service 1 ;;
