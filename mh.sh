@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.28"
+SCRIPT_VERSION="1.12.4-argo.29"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -49,7 +49,9 @@ MIHOMO_MULTI_USER="${MIHOMO_MULTI_USER:-}"
 HY2_UP_MBPS=10000
 HY2_DOWN_MBPS=10000
 GITHUB_API="${MIHOMO_GITHUB_API:-https://api.github.com/repos/MetaCubeX/mihomo/releases/latest}"
-SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/mh.sh}"
+SCRIPT_DEFAULT_RAW_URL="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/mh.sh"
+SCRIPT_RAW_URL="${MH_SCRIPT_RAW_URL:-$SCRIPT_DEFAULT_RAW_URL}"
+SCRIPT_COMMIT_API="${MH_SCRIPT_COMMIT_API:-https://api.github.com/repos/tanying-spec/Mihomo-lite-argo/commits/main}"
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 CLOUDFLARED_BACKUP_BIN="/usr/local/bin/cloudflared.previous"
 CLOUDFLARED_CONFIG_DIR="/etc/cloudflared"
@@ -5896,6 +5898,20 @@ update_script() {
       esac
       ;;
   esac
+  if [ "$SCRIPT_RAW_URL" = "$SCRIPT_DEFAULT_RAW_URL" ]; then
+    commit_json="$(curl -fsSL --max-time 15 "${SCRIPT_COMMIT_API}?mh=${update_nonce:-0}" 2>/dev/null || true)"
+    update_commit_sha="$(printf '%s\n' "$commit_json" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1)"
+    case "$update_commit_sha" in
+      ''|*[!0-9a-fA-F]*) update_commit_sha="" ;;
+    esac
+    if [ "${#update_commit_sha}" -ge 40 ] && [ "${#update_commit_sha}" -le 64 ]; then
+      script_fetch_url="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/${update_commit_sha}/mh.sh"
+      checksum_fetch_url="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/${update_commit_sha}/mh.sh.sha256"
+      ui_warn "已锁定 GitHub 提交：$(printf '%.12s' "$update_commit_sha")"
+    else
+      ui_warn "无法取得 GitHub 提交版本，将使用带缓存标记的 main 地址。"
+    fi
+  fi
   curl -fsSL "$script_fetch_url" -o "$tmp_file" || {
     rm -f "$tmp_file"
     ui_error "更新失败：无法下载最新脚本。"

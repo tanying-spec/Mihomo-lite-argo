@@ -2,7 +2,9 @@
 
 set -u
 
-RAW_BASE="${MH_RAW_BASE:-https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main}"
+DEFAULT_RAW_BASE="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main"
+RAW_BASE="${MH_RAW_BASE:-$DEFAULT_RAW_BASE}"
+COMMIT_API="${MH_COMMIT_API:-https://api.github.com/repos/tanying-spec/Mihomo-lite-argo/commits/main}"
 LOCAL_SCRIPT="${MH_LOCAL_SCRIPT:-}"
 CLI_PATH="/usr/local/bin/mh"
 CLI_BACKUP_PATH="/usr/local/bin/mh.previous"
@@ -67,6 +69,17 @@ else
       checksum_url="${checksum_url}?mh=${install_nonce}"
       ;;
   esac
+  if [ "$RAW_BASE" = "$DEFAULT_RAW_BASE" ]; then
+    commit_json="$(curl -fsSL --max-time 15 "${COMMIT_API}?mh=${install_nonce:-0}" 2>/dev/null || true)"
+    install_commit_sha="$(printf '%s\n' "$commit_json" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1)"
+    case "$install_commit_sha" in
+      ''|*[!0-9a-fA-F]*) install_commit_sha="" ;;
+    esac
+    if [ "${#install_commit_sha}" -ge 40 ] && [ "${#install_commit_sha}" -le 64 ]; then
+      script_url="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/${install_commit_sha}/mh.sh"
+      checksum_url="https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/${install_commit_sha}/mh.sh.sha256"
+    fi
+  fi
   curl -fsSL "$script_url" -o "$tmp_file" || {
     rm -f "$tmp_file"
     red "下载 mh.sh 失败。请检查网络、DNS 或 GitHub 访问是否正常。"
