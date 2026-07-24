@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.20"
+SCRIPT_VERSION="1.12.4-argo.22"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -19,6 +19,7 @@ OOM_STATE_FILE="$CONFIG_DIR/oom.state"
 STATE_LOCK_DIR="$CONFIG_DIR/state.lock"
 NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
+CREDENTIAL_ROTATIONS_DB="$CONFIG_DIR/credential-rotations.db"
 TRAFFIC_DB="$CONFIG_DIR/traffic.db"
 TRAFFIC_RULES_VERSION_FILE="$CONFIG_DIR/traffic-rules.version"
 TRAFFIC_RULES_VERSION="2"
@@ -1651,6 +1652,15 @@ configured_dns_works() {
   return 1
 }
 
+pending_node_credential() {
+  pending_proto="$1"
+  pending_old_credential="$2"
+  [ -s "$CREDENTIAL_ROTATIONS_DB" ] || return 0
+  awk -F'|' -v proto="$pending_proto" -v old="$pending_old_credential" '
+    $1 == proto && $2 == old { print $3; exit }
+  ' "$CREDENTIAL_ROTATIONS_DB" 2>/dev/null
+}
+
 dns_preflight_repair() {
   [ -f "$CONFIG_FILE" ] || return 0
   configured_dns_works && return 0
@@ -1714,6 +1724,9 @@ EOF
       [ -n "$cfg_proto" ] || continue
       cfg_node_name_yaml="$(yaml_escape "$cfg_node_name")"
       cfg_listen_address_yaml="$(yaml_escape "$cfg_listen_address")"
+      cfg_pending_credential="$(pending_node_credential "$cfg_proto" "$cfg_value1")"
+      cfg_pending_credential_yaml="$(yaml_escape "$cfg_pending_credential")"
+      cfg_pending_name_yaml="$(yaml_escape "${cfg_node_name}-next")"
       case "$cfg_proto" in
         vless-reality)
           cfg_node_uuid="$(yaml_escape "$cfg_value1")"
@@ -1730,6 +1743,12 @@ EOF
       - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
+          if [ -n "$cfg_pending_credential" ]; then
+            cat >> "$tmp_file" <<EOF
+      - username: "$cfg_pending_name_yaml"
+        uuid: "$cfg_pending_credential_yaml"
+EOF
+          fi
           cat >> "$tmp_file" <<EOF
     tls: true
     reality-config:
@@ -1754,6 +1773,9 @@ EOF
     users:
       "$cfg_node_name_yaml": "$cfg_node_password"
 EOF
+          if [ -n "$cfg_pending_credential" ]; then
+            printf '      "%s": "%s"\n' "$cfg_pending_name_yaml" "$cfg_pending_credential_yaml" >> "$tmp_file"
+          fi
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
@@ -1779,6 +1801,9 @@ EOF
     users:
       "$cfg_node_name_yaml": "$cfg_node_password"
 EOF
+          if [ -n "$cfg_pending_credential" ]; then
+            printf '      "%s": "%s"\n' "$cfg_pending_name_yaml" "$cfg_pending_credential_yaml" >> "$tmp_file"
+          fi
           cat >> "$tmp_file" <<EOF
     certificate: "$cfg_cert_file"
     private-key: "$cfg_key_file"
@@ -1804,6 +1829,12 @@ EOF
       - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
+          if [ -n "$cfg_pending_credential" ]; then
+            cat >> "$tmp_file" <<EOF
+      - username: "$cfg_pending_name_yaml"
+        uuid: "$cfg_pending_credential_yaml"
+EOF
+          fi
           cat >> "$tmp_file" <<EOF
     ws-path: "$cfg_ws_path"
 EOF
@@ -2547,7 +2578,7 @@ state_transaction_begin() {
     return 1
   }
   printf '%s\n' "$STATE_TX_DIR" > "$STATE_LOCK_DIR/txdir"
-  for state_file in nodes.db users.db traffic.db runtime.env network.env features.env multi-user.enabled; do
+  for state_file in nodes.db users.db credential-rotations.db traffic.db runtime.env network.env features.env multi-user.enabled; do
     if [ -e "$CONFIG_DIR/$state_file" ]; then
       cp "$CONFIG_DIR/$state_file" "$STATE_TX_DIR/$state_file"
     else
@@ -2573,7 +2604,7 @@ state_transaction_abort() {
 
 state_transaction_restore_files() {
   [ -n "${STATE_TX_DIR:-}" ] && [ -d "$STATE_TX_DIR" ] || return 0
-  for state_file in nodes.db users.db traffic.db runtime.env network.env features.env multi-user.enabled; do
+  for state_file in nodes.db users.db credential-rotations.db traffic.db runtime.env network.env features.env multi-user.enabled; do
     if [ -f "$STATE_TX_DIR/$state_file" ]; then
       cp "$STATE_TX_DIR/$state_file" "$CONFIG_DIR/$state_file"
       chmod 600 "$CONFIG_DIR/$state_file"
@@ -3307,7 +3338,9 @@ list_nodes() {
     [ -n "$proto" ] || continue
     case "$proto" in
       vless-reality|hysteria2|anytls|vless-ws)
-        printf ' %s%s.%s %s%s%s  protocol=%s  port=%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$node_name" "$C_RESET" "$proto" "$node_port"
+        rotation_status=""
+        [ -n "$(pending_node_credential "$proto" "$value1")" ] && rotation_status="  凭据轮换中"
+        printf ' %s%s.%s %s%s%s  protocol=%s  port=%s%s\n' "$C_GREEN" "$i" "$C_RESET" "$C_BOLD" "$node_name" "$C_RESET" "$proto" "$node_port" "$rotation_status"
         i=$((i + 1))
         ;;
     esac
@@ -3365,8 +3398,7 @@ EOF
   ui_section "$node_name ($proto)"
   printf ' %s1.%s 修改名称\n' "$C_GREEN" "$C_RESET"
   printf ' %s2.%s 修改本地监听端口\n' "$C_GREEN" "$C_RESET"
-  printf ' %s3.%s 重新生成凭据（UUID/密码）\n' "$C_GREEN" "$C_RESET"
-  [ "$proto" = "vless-ws" ] && printf ' %s4.%s 修改 WebSocket 模式、Host、Path 和入口\n' "$C_GREEN" "$C_RESET"
+  [ "$proto" = "vless-ws" ] && printf ' %s3.%s 修改 WebSocket 模式、Host、Path 和入口\n' "$C_GREEN" "$C_RESET"
   printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
   ui_prompt "请选择编辑项目："
   read -r edit_choice || true
@@ -3388,12 +3420,6 @@ EOF
       node_port="$SELECTED_NODE_PORT"
       ;;
     3)
-      case "$proto" in
-        vless-reality|vless-ws) value1="$(new_uuid)" ;;
-        hysteria2|anytls) value1="$(rand_alnum 32)" ;;
-      esac
-      ;;
-    4)
       [ "$proto" = "vless-ws" ] || { ui_error "此节点不是 VLESS-WS。"; return 1; }
       cat <<EOF
  1. IP 直连 WS
@@ -3448,18 +3474,111 @@ EOF
   print_node_link "$proto" "$node_name" "$node_port" "$value1" "$value2" "$value3" "$value4" "$value5" "$value6"
 }
 
+remove_pending_credential_record() {
+  remove_proto="$1"
+  remove_old_credential="$2"
+  [ -e "$CREDENTIAL_ROTATIONS_DB" ] || return 0
+  rotations_tmp="$(make_temp "$CONFIG_DIR/credential-rotations.XXXXXX")"
+  awk -F'|' -v proto="$remove_proto" -v old="$remove_old_credential" '
+    !($1 == proto && $2 == old) { print }
+  ' "$CREDENTIAL_ROTATIONS_DB" > "$rotations_tmp"
+  mv "$rotations_tmp" "$CREDENTIAL_ROTATIONS_DB"
+  chmod 600 "$CREDENTIAL_ROTATIONS_DB"
+}
+
+print_rotated_node_link() {
+  rotated_credential="$1"
+  print_node_link "$proto" "$node_name" "$node_port" "$rotated_credential" "$value2" "$value3" "$value4" "$value5" "$value6"
+}
+
+rotate_selected_node_credential() {
+  IFS='|' read -r proto node_name node_port value1 value2 value3 value4 value5 value6 <<EOF
+$SELECTED_NODE_RECORD
+EOF
+  pending_credential="$(pending_node_credential "$proto" "$value1")"
+
+  if [ -z "$pending_credential" ]; then
+    case "$proto" in
+      vless-reality|vless-ws) pending_credential="$(new_uuid)" ;;
+      hysteria2|anytls) pending_credential="$(rand_alnum 32)" ;;
+      *) ui_error "该协议暂不支持凭据轮换。"; return 1 ;;
+    esac
+    state_transaction_begin || return 1
+    printf '%s|%s|%s|%s\n' "$proto" "$value1" "$pending_credential" "$(date +%s 2>/dev/null || printf 0)" >> "$CREDENTIAL_ROTATIONS_DB"
+    chmod 600 "$CREDENTIAL_ROTATIONS_DB"
+    state_transaction_apply || return 1
+    ui_success "新凭据已启用，旧凭据仍然可用。"
+    print_rotated_node_link "$pending_credential"
+    ui_warn "请先在客户端导入并确认新链接可用，再次进入此功能停用旧凭据。"
+    return 0
+  fi
+
+  ui_success "此节点正在轮换：新旧凭据目前同时有效。"
+  printf ' %s1.%s 再次显示新节点链接\n' "$C_GREEN" "$C_RESET"
+  printf ' %s2.%s 新链接已验证，停用旧凭据\n' "$C_GREEN" "$C_RESET"
+  printf ' %s3.%s 取消轮换，保留旧凭据\n' "$C_GREEN" "$C_RESET"
+  printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
+  ui_prompt "请选择操作 (0-3)："
+  read -r rotation_choice || true
+  case "$rotation_choice" in
+    1)
+      print_rotated_node_link "$pending_credential"
+      ;;
+    2)
+      ui_warn "停用后，仍使用旧链接的客户端会立即无法连接。"
+      ui_prompt "确认新链接已经可用，请输入 ACTIVATE："
+      read -r rotation_confirm || true
+      [ "$rotation_confirm" = "ACTIVATE" ] || { ui_warn "确认文字不匹配，旧凭据继续保留。"; return 0; }
+      state_transaction_begin || return 1
+      nodes_tmp="$(make_temp "$CONFIG_DIR/nodes.XXXXXX")"
+      awk -F'|' -v n="$SELECTED_NODE_INDEX" -v new="$pending_credential" '
+        BEGIN { OFS = FS }
+        $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
+          i++
+          if (i == n) $4 = new
+        }
+        { print }
+      ' "$NODES_DB" > "$nodes_tmp"
+      mv "$nodes_tmp" "$NODES_DB"
+      chmod 600 "$NODES_DB"
+      remove_pending_credential_record "$proto" "$value1"
+      state_transaction_apply || return 1
+      ui_success "轮换完成：新凭据已成为正式凭据，旧凭据已停用。"
+      print_rotated_node_link "$pending_credential"
+      ;;
+    3)
+      state_transaction_begin || return 1
+      remove_pending_credential_record "$proto" "$value1"
+      state_transaction_apply || return 1
+      ui_success "轮换已取消：旧凭据继续有效，新凭据已停用。"
+      ;;
+    0) return 0 ;;
+    *) ui_error "无效选择。"; return 1 ;;
+  esac
+}
+
+rotate_node_credential() {
+  need_root
+  ensure_installed
+  screen_title "安全轮换节点凭据"
+  select_node || return 0
+  rotate_selected_node_credential
+}
+
 node_management_menu() {
   screen_title "节点管理"
   printf ' %s1.%s 编辑节点\n' "$C_GREEN" "$C_RESET"
   printf ' %s2.%s 删除节点\n' "$C_GREEN" "$C_RESET"
   printf ' %s3.%s 检测节点是否可用\n' "$C_GREEN" "$C_RESET"
+  printf ' %s4.%s 安全轮换 UUID / 密码\n' "$C_GREEN" "$C_RESET"
   printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
-  ui_prompt "请输入数字选择 (0-3)："
+  ui_prompt "请输入数字选择 (0-4)："
   read -r node_manage_choice || true
   case "$node_manage_choice" in
     1) edit_node ;;
     2) delete_node ;;
     3) test_existing_node ;;
+    4) rotate_node_credential ;;
     0) return 0 ;;
     *) ui_error "无效选择。"; return 1 ;;
   esac
@@ -3514,6 +3633,8 @@ delete_node() {
     state_transaction_begin || return 1
     : > "$NODES_DB"
     chmod 600 "$NODES_DB"
+    : > "$CREDENTIAL_ROTATIONS_DB"
+    chmod 600 "$CREDENTIAL_ROTATIONS_DB"
     if multi_user_enabled && [ -f "$USERS_DB" ]; then
       : > "$USERS_DB"
       chmod 600 "$USERS_DB"
@@ -3525,12 +3646,8 @@ delete_node() {
     return 0
   fi
 
-  deleted="$(awk -F'|' -v n="$choice" '
-    $1 == "vless-reality" || $1 == "hysteria2" || $1 == "anytls" || $1 == "vless-ws" {
-      i++
-      if (i == n) { print $2; exit }
-    }
-  ' "$NODES_DB")"
+  deleted_record="$(node_record_by_index "$choice")"
+  deleted="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $2 }')"
   if [ -z "$deleted" ]; then
     ui_error "未找到编号 $choice。"
     return 1
@@ -3557,6 +3674,9 @@ delete_node() {
   ' "$NODES_DB" > "$tmp_file"
   mv "$tmp_file" "$NODES_DB"
   chmod 600 "$NODES_DB"
+  deleted_proto="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $1 }')"
+  deleted_credential="$(printf '%s\n' "$deleted_record" | awk -F'|' '{ print $4 }')"
+  remove_pending_credential_record "$deleted_proto" "$deleted_credential"
   if multi_user_enabled; then
     remove_users_for_node "$deleted"
   fi
@@ -5751,6 +5871,12 @@ health_check() {
   health_errors=0
   health_warnings=0
 
+  pending_rotation_count="$(awk 'NF { count++ } END { print count + 0 }' "$CREDENTIAL_ROTATIONS_DB" 2>/dev/null)"
+  if [ "${pending_rotation_count:-0}" -gt 0 ]; then
+    ui_warn "有 $pending_rotation_count 个节点正在进行凭据轮换；确认新链接后请完成或取消轮换。"
+    health_warnings=$((health_warnings + 1))
+  fi
+
   if [ -x "$BIN_PATH" ] && [ -f "$CONFIG_FILE" ] && "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$CONFIG_FILE" >/dev/null 2>&1; then
     ui_success "Mihomo 配置语法正常。"
   else
@@ -6049,7 +6175,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_YELLOW}[+] 节点管理${C_RESET}
    ${C_GREEN}1.${C_RESET} 一键生成代理节点
    ${C_GREEN}2.${C_RESET} 查看所有节点链接
-   ${C_GREEN}3.${C_RESET} 编辑 / 删除节点
+   ${C_GREEN}3.${C_RESET} 编辑 / 删除 / 检测 / 凭据轮换
 
   ${C_YELLOW}[+] 核心管理${C_RESET}
    ${C_GREEN}4.${C_RESET} 一键安装 Mihomo 内核
@@ -6132,6 +6258,7 @@ case "${1:-}" in
   list|nodes) show_all_nodes ;;
   config) show_config ;;
   test-node|node-test) test_existing_node ;;
+  rotate-credential|credential-rotate) rotate_node_credential ;;
   delete|del|remove) delete_node ;;
   restart) need_root; ensure_installed; restart_service ;;
   dns-migrate|dns-repair) need_root; ensure_installed; dns_preflight_repair && restart_service 1 ;;
