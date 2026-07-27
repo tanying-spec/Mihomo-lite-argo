@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.30"
+SCRIPT_VERSION="1.12.4-argo.31"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -21,6 +21,7 @@ NODES_DB="$CONFIG_DIR/nodes.db"
 USERS_DB="$CONFIG_DIR/users.db"
 CREDENTIAL_ROTATIONS_DB="$CONFIG_DIR/credential-rotations.db"
 TRAFFIC_DB="$CONFIG_DIR/traffic.db"
+FANOUT_BINDINGS_DB="$CONFIG_DIR/fanout-bindings.db"
 TRAFFIC_RULES_VERSION_FILE="$CONFIG_DIR/traffic-rules.version"
 TRAFFIC_RULES_VERSION="2"
 TRAFFIC_CHAIN="MIHOMO_LITE_USERS"
@@ -1535,6 +1536,35 @@ render_user_listeners() {
   done < "$USERS_DB"
 }
 
+render_fanout_users_for_node() {
+  fanout_source_node="$1"
+  [ -s "$FANOUT_BINDINGS_DB" ] || return 0
+  while IFS='|' read -r fanout_name fanout_node fanout_uuid fanout_port fanout_created; do
+    [ "$fanout_node" = "$fanout_source_node" ] || continue
+    printf '      - username: "%s"\n        uuid: "%s"\n' \
+      "$(yaml_escape "$fanout_name")" "$(yaml_escape "$fanout_uuid")"
+  done < "$FANOUT_BINDINGS_DB"
+}
+
+render_fanout_proxies() {
+  [ -s "$FANOUT_BINDINGS_DB" ] || { printf 'proxies: []\n'; return 0; }
+  printf 'proxies:\n'
+  while IFS='|' read -r fanout_name fanout_node fanout_uuid fanout_port fanout_created; do
+    [ -n "$fanout_name" ] || continue
+    printf '  - name: "fanout-%s"\n' "$(yaml_escape "$fanout_name")"
+    printf '    type: socks5\n    server: 127.0.0.1\n    port: %s\n    udp: false\n' "$fanout_port"
+  done < "$FANOUT_BINDINGS_DB"
+}
+
+render_fanout_rules() {
+  [ -s "$FANOUT_BINDINGS_DB" ] || return 0
+  while IFS='|' read -r fanout_name fanout_node fanout_uuid fanout_port fanout_created; do
+    [ -n "$fanout_name" ] || continue
+    printf '  - "IN-USER,%s,fanout-%s"\n' \
+      "$(yaml_escape "$fanout_name")" "$(yaml_escape "$fanout_name")"
+  done < "$FANOUT_BINDINGS_DB"
+}
+
 dns_is_address() {
   case "${1:-}" in
     ''|0.0.0.0|::|*[!0-9A-Fa-f:.]*) return 1 ;;
@@ -1746,6 +1776,7 @@ EOF
       - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
+          render_fanout_users_for_node "$cfg_node_name" >> "$tmp_file"
           if [ -n "$cfg_pending_credential" ]; then
             cat >> "$tmp_file" <<EOF
       - username: "$cfg_pending_name_yaml"
@@ -1832,6 +1863,7 @@ EOF
       - username: "$cfg_node_name_yaml"
         uuid: "$cfg_node_uuid"
 EOF
+          render_fanout_users_for_node "$cfg_node_name" >> "$tmp_file"
           if [ -n "$cfg_pending_credential" ]; then
             cat >> "$tmp_file" <<EOF
       - username: "$cfg_pending_name_yaml"
@@ -1849,16 +1881,17 @@ EOF
     printf 'listeners: []\n' >> "$tmp_file"
   fi
 
+  render_fanout_proxies >> "$tmp_file"
   cat >> "$tmp_file" <<'EOF'
-proxies: []
 proxy-groups:
   - name: Proxy
     type: select
     proxies:
       - DIRECT
 rules:
-  - MATCH,DIRECT
 EOF
+  render_fanout_rules >> "$tmp_file"
+  printf '  - MATCH,DIRECT\n' >> "$tmp_file"
 
   if [ -x "$BIN_PATH" ]; then
     if ! "$BIN_PATH" -t -d "$CONFIG_DIR" -f "$tmp_file" >/dev/null 2>&1; then
@@ -2105,6 +2138,8 @@ install_core() {
 
   [ -f "$NODES_DB" ] || : > "$NODES_DB"
   chmod 600 "$NODES_DB"
+  [ -f "$FANOUT_BINDINGS_DB" ] || : > "$FANOUT_BINDINGS_DB"
+  chmod 600 "$FANOUT_BINDINGS_DB"
   if multi_user_enabled; then
     [ -f "$USERS_DB" ] || : > "$USERS_DB"
     chmod 600 "$USERS_DB"
@@ -2648,7 +2683,7 @@ state_transaction_begin() {
     return 1
   }
   printf '%s\n' "$STATE_TX_DIR" > "$STATE_LOCK_DIR/txdir"
-  for state_file in nodes.db users.db credential-rotations.db traffic.db runtime.env network.env features.env multi-user.enabled; do
+  for state_file in nodes.db users.db credential-rotations.db traffic.db fanout-bindings.db runtime.env network.env features.env multi-user.enabled; do
     if [ -e "$CONFIG_DIR/$state_file" ]; then
       cp "$CONFIG_DIR/$state_file" "$STATE_TX_DIR/$state_file"
     else
@@ -2674,7 +2709,7 @@ state_transaction_abort() {
 
 state_transaction_restore_files() {
   [ -n "${STATE_TX_DIR:-}" ] && [ -d "$STATE_TX_DIR" ] || return 0
-  for state_file in nodes.db users.db credential-rotations.db traffic.db runtime.env network.env features.env multi-user.enabled; do
+  for state_file in nodes.db users.db credential-rotations.db traffic.db fanout-bindings.db runtime.env network.env features.env multi-user.enabled; do
     if [ -f "$STATE_TX_DIR/$state_file" ]; then
       cp "$STATE_TX_DIR/$state_file" "$CONFIG_DIR/$state_file"
       chmod 600 "$CONFIG_DIR/$state_file"
@@ -6256,6 +6291,154 @@ uninstall_all() {
   fi
 }
 
+fanout_source_record() {
+  fanout_source="$1"
+  awk -F'|' -v name="$fanout_source" '
+    ($1 == "vless-reality" || $1 == "vless-ws") && $2 == name { print; exit }
+  ' "$NODES_DB" 2>/dev/null
+}
+
+fanout_port_is_ready() {
+  fanout_check_port="$1"
+  case "$fanout_check_port" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$fanout_check_port" -ge 1 ] && [ "$fanout_check_port" -le 65535 ] || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk -v p="$fanout_check_port" '$4 == "127.0.0.1:" p {found=1} END{exit found?0:1}'
+  else
+    netstat -ltn 2>/dev/null | awk -v p="$fanout_check_port" '$4 == "127.0.0.1:" p {found=1} END{exit found?0:1}'
+  fi
+}
+
+fanout_binding_link() {
+  fanout_link_name="$1"
+  fanout_binding_record="$(awk -F'|' -v name="$fanout_link_name" '$1==name{print;exit}' "$FANOUT_BINDINGS_DB" 2>/dev/null)"
+  [ -n "$fanout_binding_record" ] || return 1
+  IFS='|' read -r fanout_name fanout_node fanout_uuid fanout_port fanout_created <<EOF
+$fanout_binding_record
+EOF
+  fanout_node_record="$(fanout_source_record "$fanout_node")"
+  [ -n "$fanout_node_record" ] || return 1
+  IFS='|' read -r fanout_proto fanout_base_name fanout_base_port fanout_old_uuid fanout_value2 fanout_value3 fanout_value4 fanout_value5 fanout_value6 <<EOF
+$fanout_node_record
+EOF
+  node_share_link "$fanout_proto" "$fanout_name" "$fanout_base_port" "$fanout_uuid" \
+    "$fanout_value2" "$fanout_value3" "$fanout_value4" "$fanout_value5" "$fanout_value6"
+}
+
+fanout_list_bindings() {
+  if [ ! -s "$FANOUT_BINDINGS_DB" ]; then
+    ui_warn "当前没有 Mihomo fanout 专用节点。"
+    return 0
+  fi
+  ui_section "fanout 专用节点"
+  while IFS='|' read -r fanout_name fanout_node fanout_uuid fanout_port fanout_created; do
+    fanout_state="不可用"
+    fanout_port_is_ready "$fanout_port" && fanout_state="已连接"
+    printf ' %s  复用节点=%s  SOCKS=%s  状态=%s\n' "$fanout_name" "$fanout_node" "$fanout_port" "$fanout_state"
+    fanout_binding_link "$fanout_name" || true
+    printf '\n'
+  done < "$FANOUT_BINDINGS_DB"
+}
+
+fanout_add_binding() {
+  need_root
+  ensure_installed
+  fanout_requested_name="${1:-}"
+  fanout_requested_node="${2:-}"
+  fanout_requested_port="${3:-}"
+  fanout_name="$fanout_requested_name"
+  fanout_node="$fanout_requested_node"
+  fanout_port="$fanout_requested_port"
+  if [ -z "$fanout_node" ]; then
+    fanout_node="$(awk -F'|' '$1=="vless-reality"||$1=="vless-ws"{print $2;exit}' "$NODES_DB")"
+  fi
+  if [ -z "$fanout_port" ] && [ -r /var/lib/fanout/state.json ] && command -v jq >/dev/null 2>&1; then
+    fanout_port="$(jq -r '.tunnels[] | select(.port != null) | .port' /var/lib/fanout/state.json 2>/dev/null | sed -n '1p')"
+  fi
+  [ -n "$fanout_name" ] || { ui_error "请提供节点名称，例如：mh fanout add JP-Fanout"; return 1; }
+  fanout_name="$(printf '%s' "$fanout_name" | tr -cd 'A-Za-z0-9_.-')"
+  [ -n "$fanout_name" ] || { ui_error "节点名称无效。"; return 1; }
+  [ -n "$(fanout_source_record "$fanout_node")" ] || { ui_error "只能复用已有 VLESS Reality/WS 节点。"; return 1; }
+  if awk -F'|' -v name="$fanout_name" '$1==name{found=1}END{exit found?0:1}' "$FANOUT_BINDINGS_DB" 2>/dev/null; then
+    ui_error "fanout 节点 $fanout_name 已存在。"
+    return 1
+  fi
+  fanout_port_is_ready "$fanout_port" || { ui_error "127.0.0.1:$fanout_port 没有可用的 fanout SOCKS5。"; return 1; }
+  if ! curl -fsS --max-time 20 --socks5-hostname "127.0.0.1:$fanout_port" https://api.ipify.org >/dev/null 2>&1; then
+    ui_error "fanout SOCKS5 出口验证失败，未修改 Mihomo。"
+    return 1
+  fi
+  fanout_uuid="$(new_uuid)"
+  state_transaction_begin || return 1
+  fanout_requested_name="$fanout_name"
+  fanout_requested_node="$fanout_node"
+  fanout_requested_port="$fanout_port"
+  printf '%s|%s|%s|%s|%s\n' "$fanout_requested_name" "$fanout_requested_node" "$fanout_uuid" "$fanout_requested_port" "$(date +%s 2>/dev/null || printf 0)" >> "$FANOUT_BINDINGS_DB"
+  chmod 600 "$FANOUT_BINDINGS_DB"
+  state_transaction_apply || return 1
+  ui_success "fanout 专用节点 $fanout_requested_name 已创建，原节点出口保持不变。"
+  fanout_binding_link "$fanout_requested_name"
+}
+
+fanout_delete_binding() {
+  need_root
+  ensure_installed
+  fanout_name="${1:-}"
+  [ -n "$fanout_name" ] || { ui_error "请提供要删除的 fanout 节点名称。"; return 1; }
+  awk -F'|' -v name="$fanout_name" '$1==name{found=1}END{exit found?0:1}' "$FANOUT_BINDINGS_DB" 2>/dev/null || {
+    ui_error "未找到 fanout 节点 $fanout_name。"; return 1;
+  }
+  [ "${MIHOMO_FANOUT_DELETE_CONFIRM:-}" = DELETE ] || {
+    ui_error "确认删除请执行：MIHOMO_FANOUT_DELETE_CONFIRM=DELETE mh fanout delete $fanout_name"
+    return 1
+  }
+  state_transaction_begin || return 1
+  fanout_tmp="$(make_temp "$CONFIG_DIR/fanout-bindings.XXXXXX")"
+  awk -F'|' -v name="$fanout_name" '$1!=name{print}' "$FANOUT_BINDINGS_DB" > "$fanout_tmp"
+  mv "$fanout_tmp" "$FANOUT_BINDINGS_DB"
+  chmod 600 "$FANOUT_BINDINGS_DB"
+  state_transaction_apply || return 1
+  ui_success "fanout 专用节点 $fanout_name 已删除，原节点未修改。"
+}
+
+fanout_panel() {
+  fanout_action="${1:-menu}"
+  case "$fanout_action" in
+    add) fanout_add_binding "${2:-}" "${3:-}" "${4:-}" ;;
+    delete|del|remove) fanout_delete_binding "${2:-}" ;;
+    list|show) fanout_list_bindings ;;
+    menu|'')
+      screen_title "fanout 专用出口节点"
+      printf ' %s1.%s 新建 fanout 专用节点\n' "$C_GREEN" "$C_RESET"
+      printf ' %s2.%s 查看节点和链接\n' "$C_GREEN" "$C_RESET"
+      printf ' %s3.%s 删除 fanout 专用节点\n' "$C_GREEN" "$C_RESET"
+      printf ' %s0.%s 返回\n' "$C_GREEN" "$C_RESET"
+      ui_prompt "请选择 (0-3)："
+      read -r fanout_choice || true
+      case "$fanout_choice" in
+        1)
+          ui_prompt "节点名称（例如 JP-Fanout）："
+          read -r fanout_menu_name || true
+          fanout_add_binding "$fanout_menu_name"
+          ;;
+        2) fanout_list_bindings ;;
+        3)
+          fanout_list_bindings
+          ui_prompt "请输入要删除的节点名称："
+          read -r fanout_menu_name || true
+          ui_prompt "输入 DELETE 确认："
+          read -r fanout_menu_confirm || true
+          [ "$fanout_menu_confirm" = DELETE ] || { ui_warn "已取消。"; return 0; }
+          MIHOMO_FANOUT_DELETE_CONFIRM=DELETE fanout_delete_binding "$fanout_menu_name"
+          ;;
+        0) return 0 ;;
+        *) ui_error "无效选择。"; return 1 ;;
+      esac
+      ;;
+    *) ui_error "用法：mh fanout [list|add 名称 [复用节点] [SOCKS端口]|delete 名称]"; return 1 ;;
+  esac
+}
+
 prepare_home_dashboard() {
   dashboard_mihomo="$(service_status_text)"
   if [ ! -x "$CLOUDFLARED_BIN" ] && [ ! -s "$CLOUDFLARED_TOKEN_FILE" ]; then
@@ -6314,11 +6497,11 @@ menu() {
     clear 2>/dev/null || true
     prepare_home_dashboard
     multi_user_menu_line=""
-    menu_choices="0-11/22/33/44/55/66/88"
+    menu_choices="0-11/22/33/44/55/66/88/99"
     invalid_choices="0-11、22、33、44、55、66 或 88"
     if multi_user_enabled; then
       multi_user_menu_line="   ${C_GREEN}77.${C_RESET} 多用户管理面板"
-      menu_choices="0-11/22/33/44/55/66/77/88"
+      menu_choices="0-11/22/33/44/55/66/77/88/99"
       invalid_choices="0-11、22、33、44、55、66、77 或 88"
     fi
     
@@ -6360,6 +6543,7 @@ ${C_CYAN}----------------------------------------------------${C_RESET}
    ${C_GREEN}55.${C_RESET} 网络状态与一键优化
    ${C_GREEN}66.${C_RESET} IPv6 支持设置
 $multi_user_menu_line
+   ${C_GREEN}99.${C_RESET} fanout 专用出口节点
    ${C_GREEN}88.${C_RESET} Argo / Cloudflare Tunnel 管理
 ${C_CYAN}----------------------------------------------------${C_RESET}
  ${C_GREEN}0.${C_RESET} => 退出脚本面板
@@ -6386,6 +6570,7 @@ EOF
       55) network_optimization_menu ;;
       66) ipv6_settings_menu; pause ;;
       88) cloudflared_menu ;;
+      99) fanout_panel; pause ;;
       77)
         if multi_user_enabled; then
           multi_user_panel; pause
@@ -6411,6 +6596,7 @@ case "${1:-}" in
   network-migrate|net-migrate) need_root; migrate_legacy_sysctl_config ;;
   ipv6|ip6|66) ipv6_settings_menu ;;
   argo|tunnel|cloudflared|88) cloudflared_menu ;;
+  fanout|fanout-node|99) shift; fanout_panel "$@" ;;
   tunnel-watchdog) run_tunnel_watchdog ;;
   tunnel-watchdog-on) need_root; enable_tunnel_watchdog ;;
   tunnel-watchdog-off) need_root; disable_tunnel_watchdog ;;
