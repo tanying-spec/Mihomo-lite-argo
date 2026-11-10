@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/tanying-spec/Mihomo-lite-argo/main/
 
 客户端使用该公共主机名的 `443` 端口、TLS，以及相同的 WebSocket Host 和 Path。Tunnel 主动向 Cloudflare 建立出站连接，因此 WS 本地端口无需 NAT 映射，也不需要 DDNS。卸载 Argo 不会删除 Mihomo 或节点配置。
 
-多线程测速会同时增加 WebSocket 连接数、文件描述符和内存缓冲。脚本为 cloudflared 设置 `262144` 文件描述符上限，并根据容器内存设置 Go 内存目标；低内存 LXC 仍建议使用菜单 `44` 的省资源稳连模式并控制测速线程数。如果节点突然不可用，可进入菜单 `88` 重启 Tunnel；该操作会先检查本地 Mihomo 源站，并在失败时联动恢复。菜单 `88` 的压力诊断可检查 cgroup OOM 计数和最近服务日志。
+多线程测速会同时增加 WebSocket 连接数、文件描述符和内存缓冲。脚本为 cloudflared 设置 `262144` 文件描述符上限，并根据容器内存设置 Go 内存目标；不超过 256MiB 的低内存容器默认使用保守内存预算，并禁用高吞吐档位，建议只做单线程测速。如果节点突然不可用，可进入菜单 `88` 重启 Tunnel；该操作会先检查本地 Mihomo 源站，并在失败时联动恢复。菜单 `88` 的压力诊断可检查 cgroup OOM 计数和最近服务日志。
 
 Tunnel 自动恢复默认随固定隧道安装或手动重启启用，也可在菜单 `88` 中开关。进程退出时仍由 Systemd/OpenRC 立即拉起；健康守护用于处理“进程仍在但边缘连接为0”或“本地 Mihomo WS 源站失效”的半失效状态。恢复记录写入 `/var/log/mihomo/tunnel-watchdog.log`。
 
@@ -103,7 +103,7 @@ Tunnel 自动恢复默认随固定隧道安装或手动重启启用，也可在�
 
 菜单输入 `44` 可调整 Mihomo 的 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`，支持省资源稳连、系统推荐、高吞吐/跑满带宽和自定义参数。
 
-三种预设会保持明确差异：省资源模式使用更低的内存目标和更高的 `GOGC`，系统推荐模式取折中值，高吞吐模式使用更高的内存目标和更积极的 GC。单核或 CPU 配额受限的容器中，三档的 `GOMAXPROCS` 都可能是 `1`，这是正常现象。内存检测会取 cgroup 限制与 `/proc/meminfo` 可见内存中的较小值；如果两者都无法读取，菜单会显示警告并采用保守兜底值。
+三种预设会保持明确差异：省资源模式使用更低的内存目标和更积极的 GC，系统推荐模式取折中值，高吞吐模式使用更高的内存目标并适当降低 GC 频率。单核或 CPU 配额受限的容器中，三档的 `GOMAXPROCS` 都可能是 `1`，这是正常现象。内存检测会取 cgroup 限制与 `/proc/meminfo` 可见内存中的较小值；如果两者都无法读取，菜单会显示警告并采用保守兜底值。总内存不超过 256MiB 时，高吞吐模式不可用，以免 Mihomo、cloudflared 和网络缓冲共同触发 OOM。
 
 菜单输入 `55` 可打开简化的网络诊断菜单：查看当前网络状态、一键完成约 25 MB 的真实测试并应用经过验证的安全建议、查看已应用参数，以及恢复修改前参数。测试会显示吞吐、首字节及 TCP 重传、超时、UDP 缓冲错误、监听丢弃和 OOM 增量；测试失败时不修改任何参数。
 
@@ -147,10 +147,10 @@ Tunnel 自动恢复默认随固定隧道安装或手动重启启用，也可在�
 * Mihomo 每次重启前都会验证当前 DNS 上游；不可达时自动选择有效上游、重写配置并重启复验一次。`mh update` 会自动迁移旧版生成的错误 DNS 配置，也可手动执行 `mh dns-migrate`。
 * 默认日志级别为 `warning`，减少高流量时的日志开销。
 * 执行 `mh install` 时会提示填写 `GOMEMLIMIT`、`GOGC` 和 `GOMAXPROCS`，并自动写入 `GODEBUG=madvdontneed=1` 以降低 Go 运行时长期保留的 RSS。
-* `GOMEMLIMIT` 会优先按 cgroup v2/v1 硬内存限制生成推荐值，给系统、TLS/QUIC 缓冲和内核网络缓冲预留余量；不会把 `memory.high` 或可能显示宿主机内存的 `/proc/meminfo` 当作容器限制。
-* 推荐档默认使用更高的 `GOGC`，在 `GOMEMLIMIT` 兜底下减少 Go GC 频率，降低高速率下的 CPU 开销。
+* `GOMEMLIMIT` 会取 cgroup v2/v1 硬内存限制与 `/proc/meminfo` 可见内存中的较小值生成推荐值，给其他服务和网络缓冲预留余量；不把 `memory.high` 当作硬上限。容器没有暴露硬上限时，`MemTotal` 可能仍是宿主机视图，需要核实实际配额，不能保证自动推荐值适合这种环境。
+* 低内存档使用较低的 `GOGC` 主动回收临时堆；内存充足时才逐步提高 `GOGC`，减少高速率下的 CPU 开销。
 * `GOMAXPROCS` 会优先按 cgroup CPU 配额推荐，避免 LXC 容器误用宿主机 CPU 数导致调度开销过高。
-* 当检测到 cgroup CPU quota 小于 1 核时，脚本会按 CPU 严重受限容器处理：限制 `GOMAXPROCS=1`，提高 `GOGC`，减少调度和 GC 额外开销。
+* 当检测到 cgroup CPU quota 小于 1 核时，限制 `GOMAXPROCS=1`；总内存不超过 512MiB 时保留低内存 GC 阈值，不再因为 CPU 配额低而提高 `GOGC`、覆盖内存保护。
 * 后续可通过菜单 `44` 随时切换运行时性能档位；其中省资源稳连和高吞吐/跑满带宽模式会关闭自动流量统计并移除 iptables 统计规则，减少包路径开销。
 * 菜单 `55` 采用诊断优先的保守网络优化；容器无权限的 sysctl 项不会伪报成功，首次修改前记录原值，完整卸载时恢复，并会清理旧版生成的激进持久化配置。
 * 未检测到明确内存限制时，Alpine 使用更保守推荐值，Debian / Ubuntu 使用略高推荐值；检测到 128/256/512MiB 等小内存容器时会自动下调 `GOMEMLIMIT`，同时避免把 `GOGC` 压得过低导致 CPU 消耗过高。
@@ -162,6 +162,20 @@ MIHOMO_GOMEMLIMIT=384MiB MIHOMO_GOGC=150 MIHOMO_GOMAXPROCS=2 MIHOMO_GODEBUG=madv
 ```
 
 如果容器内存极低、CPU quota 小于 1 核，或多线程测速后仍然断流，优先在菜单 `44` 使用 `省资源稳连模式`；需要压测带宽时使用 `高吞吐/跑满带宽模式`，该模式同样会暂停自动流量统计和 iptables 统计链。
+
+#### 已安装机器迁移低内存参数
+
+仅更新脚本不会覆盖 `/etc/mihomo/runtime.env` 内保存的旧值；`mh apply-runtime` 也会保留这些值。更新脚本后，可执行：
+
+```sh
+mh memory-safe
+```
+
+该命令备份旧参数到 `/etc/mihomo/runtime.env.before-memory-safe`，重新按机器内存与 CPU 生成推荐值，并重写服务、重启 Mihomo。例如约 183MiB 的容器采用 `GOMEMLIMIT=64MiB、GOGC=50、GOMAXPROCS=1`，不会继续沿用旧的 `GOGC=175`。
+
+`GOMEMLIMIT` 是 Go 运行时的软目标，不是进程 RSS 或整个容器的硬上限；内核 socket 缓冲、其他服务以及无法回收的活跃数据也会占用内存。单线程高速测速同样可能 OOM，不能以“单线程”作为安全保证。复测时应对比 OOM 计数增量，同时观察 `memory.stat` 中的 `anon`、`sock` 和 `kernel`。
+
+安装内核、应用运行参数或执行 `mh memory-safe` 时，脚本会同步检查小内存机器的 TCP/显式 socket 缓冲上限：不超过 128MiB 时收紧到 2MiB，不超过 256MiB 时为 4MiB，不超过 512MiB 时为 8MiB。仅降低超过预算的值，保留原有更小值；只尝试当前网络命名空间允许写入的四项参数，不修改 `tcp_mem` 或连接队列。修改前记录原值，可在菜单 `55` 恢复。容器禁止修改时明确报告；内存未知或大于 512MiB 时不自动限制。这可能降低高延迟线路的单连接峰值速度，也不能保证任意并发下不 OOM。该操作不会启用已停止的 Tunnel。
 
 节点链接里的公网 IP 会缓存到 `/etc/mihomo/public.ip`，默认 6 小时自动过期。也可以删除该文件立即刷新，或通过环境变量 `MIHOMO_PUBLIC_IP_CACHE_TTL` 调整缓存秒数。
 

@@ -4,7 +4,7 @@ set -u
 
 SCRIPT_AUTHOR="oKafuChino"
 SCRIPT_OPTIMIZER="TANYING"
-SCRIPT_VERSION="1.12.4-argo.30"
+SCRIPT_VERSION="1.12.4-argo.31"
 BIN_PATH="/usr/local/bin/mihomo"
 BIN_BACKUP_PATH="/usr/local/bin/mihomo.previous"
 CLI_PATH="/usr/local/bin/mh"
@@ -580,8 +580,9 @@ normalize_runtime_profiles() {
     *[!0-9:]*|:*|*:)
       ;;
     *)
-      if [ "$resource_gogc" -le "$recommended_gogc" ]; then
-        resource_gogc=$((recommended_gogc + 50))
+      if [ "$resource_gogc" -ge "$recommended_gogc" ]; then
+        resource_gogc=$((recommended_gogc - 25))
+        [ "$resource_gogc" -lt 50 ] && resource_gogc=50
       fi
       ;;
   esac
@@ -589,13 +590,8 @@ normalize_runtime_profiles() {
     *[!0-9:]*|:*|*:)
       ;;
     *)
-      if [ "$throughput_gogc" -ge "$recommended_gogc" ]; then
-        throughput_gogc=$((recommended_gogc - 50))
-        if [ "$recommended_gogc" -gt 75 ] && [ "$throughput_gogc" -lt 75 ]; then
-          throughput_gogc=75
-        elif [ "$throughput_gogc" -lt 50 ]; then
-          throughput_gogc=50
-        fi
+      if [ "$throughput_gogc" -le "$recommended_gogc" ]; then
+        throughput_gogc=$((recommended_gogc + 25))
       fi
       ;;
   esac
@@ -613,12 +609,12 @@ recommended_runtime() {
       ;;
     *)
       if [ "$memory_mib" -le 192 ]; then
-        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 48)"
-        recommended_gogc="75"
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 35 48 96)"
+        recommended_gogc="50"
         cpu_count="$(cap_cpu_count "$cpu_count" 1)"
       elif [ "$memory_mib" -le 256 ]; then
-        recommended_mem="$(memlimit_from_percent "$memory_mib" 60 64 64)"
-        recommended_gogc="100"
+        recommended_mem="$(memlimit_from_percent "$memory_mib" 40 64 112)"
+        recommended_gogc="75"
         cpu_count="$(cap_cpu_count "$cpu_count" 1)"
       elif [ "$memory_mib" -le 512 ]; then
         recommended_mem="$(memlimit_from_percent "$memory_mib" 60 96 96)"
@@ -644,8 +640,9 @@ recommended_runtime() {
         esac
       fi
       if [ "$cpu_limited" = "1" ]; then
-        case "$recommended_gogc" in ''|*[!0-9]*) recommended_gogc="175" ;; esac
-        if [ "$recommended_gogc" -lt 175 ]; then
+        # A fractional CPU quota must not undo the small-memory GC budget.
+        # GOMEMLIMIT is soft and excludes kernel/socket memory.
+        if [ "$memory_mib" -gt 512 ] && [ "$recommended_gogc" -lt 175 ]; then
           recommended_gogc="175"
         fi
         cpu_count="$(cap_cpu_count "$cpu_count" 1)"
@@ -2128,6 +2125,7 @@ install_core() {
   fi
 
   core_install_failed=0
+  apply_low_memory_network_budget || core_install_failed=1
   manager="$(service_manager)"
   case "$manager" in
     systemd) write_systemd_service || core_install_failed=1 ;;
@@ -4615,6 +4613,7 @@ show_logs() {
 }
 
 apply_runtime_service() {
+  apply_low_memory_network_budget || return 1
   manager="$(service_manager)"
   case "$manager" in
     systemd)
@@ -4650,6 +4649,29 @@ apply_saved_runtime_service() {
   validate_runtime_tuning
   write_runtime_tuning
   apply_runtime_service
+}
+
+apply_memory_safe_runtime() {
+  need_root
+  ensure_installed
+  detect_os
+  safe_recommended="$(recommended_runtime)"
+  MIHOMO_GOMEMLIMIT="${safe_recommended%%|*}"
+  safe_rest="${safe_recommended#*|}"
+  MIHOMO_GOGC="${safe_rest%%|*}"
+  MIHOMO_GOMAXPROCS="${safe_rest#*|}"
+  load_runtime_tuning
+  validate_runtime_tuning || return 1
+  if [ -f "$RUNTIME_ENV_FILE" ]; then
+    cp -p "$RUNTIME_ENV_FILE" "$RUNTIME_ENV_FILE.before-memory-safe" || return 1
+  fi
+  write_runtime_tuning || return 1
+  if ! apply_runtime_service; then
+    ui_error "服务应用失败；原参数保存在 $RUNTIME_ENV_FILE.before-memory-safe，请检查服务日志。"
+    return 1
+  fi
+  ui_success "已应用内存优先推荐值：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS。"
+  ui_warn "GOMEMLIMIT 是 Go 软目标，不限制容器总内存；单线程高速传输也可能耗尽 socket 缓冲余量。"
 }
 
 performance_tuning_menu() {
@@ -4695,37 +4717,38 @@ performance_tuning_menu() {
       case "${os_id:-}" in
         alpine)
           resource_mem="192MiB"
-          resource_gogc="175"
+          resource_gogc="100"
           throughput_mem="256MiB"
-          throughput_gogc="175"
+          throughput_gogc="200"
           throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
           ;;
         *)
           resource_mem="384MiB"
-          resource_gogc="200"
+          resource_gogc="125"
           throughput_mem="512MiB"
-          throughput_gogc="200"
+          throughput_gogc="225"
           throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
           ;;
       esac
       ;;
     *)
-      resource_mem="$(memlimit_from_percent "$detected_memory_mib" 60 64 64 512)"
+      resource_mem="$(memlimit_from_percent "$detected_memory_mib" 40 64 112 512)"
       throughput_mem="$(memlimit_from_percent "$detected_memory_mib" 70 128 64 1024)"
       if [ "$detected_memory_mib" -le 256 ]; then
-        resource_gogc="175"
+        resource_mem="$recommended_mem"
+        resource_gogc="75"
         throughput_gogc="150"
         throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
       elif [ "$detected_memory_mib" -le 512 ]; then
-        resource_gogc="200"
+        resource_gogc="100"
         throughput_gogc="175"
         throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
       elif [ "$detected_memory_mib" -le 1024 ]; then
-        resource_gogc="225"
+        resource_gogc="125"
         throughput_gogc="200"
         throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 2)"
       else
-        resource_gogc="250"
+        resource_gogc="150"
         throughput_gogc="250"
         throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 4)"
       fi
@@ -4734,8 +4757,6 @@ performance_tuning_menu() {
   if cpu_quota_severely_limited; then
     resource_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
     throughput_gomaxprocs="$(cap_cpu_count "$recommended_gomaxprocs" 1)"
-    [ "$resource_gogc" -lt 200 ] && resource_gogc="200"
-    [ "$throughput_gogc" -lt 175 ] && throughput_gogc="175"
   fi
   normalize_runtime_profiles
 
@@ -4764,7 +4785,7 @@ EOF
 
   case "$perf_choice" in
     1)
-      ui_warn "省资源稳连模式会限制 Go 调度线程、提高 GOGC，并关闭自动流量统计以降低 CPU。"
+      ui_warn "省资源稳连模式会限制 Go 调度线程、降低内存目标并更积极回收，关闭自动流量统计；GC 的 CPU 开销可能上升。"
       ui_prompt "确认应用省资源稳连模式？输入 y 确认："
       read -r resource_confirm || true
       case "$resource_confirm" in
@@ -4790,7 +4811,10 @@ EOF
       case "$detected_memory_mib" in
         ''|*[!0-9]*) ;;
         *)
-          if [ "$detected_memory_mib" -le 512 ]; then
+          if [ "$detected_memory_mib" -le 256 ]; then
+            ui_error "当前总内存仅 ${detected_memory_mib}MiB；为避免 mihomo、cloudflared 与网络缓冲争抢内存，已禁用高吞吐模式。"
+            return 1
+          elif [ "$detected_memory_mib" -le 512 ]; then
             ui_warn "当前总内存仅 ${detected_memory_mib}MiB；高吞吐模式可能挤压 cloudflared 和系统内存，不建议长期使用。"
           fi
           ;;
@@ -4842,6 +4866,96 @@ EOF
     ui_success "已关闭自动流量统计并清理 iptables 统计规则，降低包路径 CPU 开销。"
   fi
   ui_success "性能参数已更新：GOMEMLIMIT=$MIHOMO_GOMEMLIMIT，GOGC=$MIHOMO_GOGC，GOMAXPROCS=$MIHOMO_GOMAXPROCS，GODEBUG=$MIHOMO_GODEBUG。"
+}
+
+low_memory_socket_cap() {
+  socket_budget_mib="$(memory_limit_mib)"
+  case "$socket_budget_mib" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *)
+      if [ "$socket_budget_mib" -le 128 ]; then
+        printf '2097152\n'
+      elif [ "$socket_budget_mib" -le 256 ]; then
+        printf '4194304\n'
+      elif [ "$socket_budget_mib" -le 512 ]; then
+        printf '8388608\n'
+      else
+        printf '0\n'
+      fi
+      ;;
+  esac
+}
+
+cap_socket_memory_value() {
+  # Preserve smaller administrator limits and clamp every element of TCP's
+  # min/default/max vector. Never infer a container-wide limit from tcp_mem,
+  # which may describe the host instead of this network namespace.
+  awk -v cap="$2" 'BEGIN {
+    count = split(ARGV[1], values, /[[:space:]]+/);
+    if (count != 1 && count != 3) exit 1;
+    for (i = 1; i <= count; i++) {
+      if (values[i] !~ /^[0-9]+$/) exit 1;
+      if (values[i] > cap) values[i] = cap;
+      if (i > 1 && values[i] < values[i-1]) exit 1;
+    }
+    for (i = 1; i <= count; i++) printf "%s%.0f", i == 1 ? "" : " ", values[i];
+    printf "\n";
+    exit;
+  }' "$1"
+}
+
+apply_low_memory_network_budget() {
+  memory_socket_cap="$(low_memory_socket_cap)"
+  [ "$memory_socket_cap" -gt 0 ] || return 0
+  command -v sysctl >/dev/null 2>&1 || {
+    ui_warn "缺少 sysctl，未应用低内存网络缓冲预算。"
+    return 0
+  }
+  memory_network_tmp="$(make_temp /tmp/mihomo-memory-net.XXXXXX)"
+  if [ -f "$SYSCTL_CONF_FILE" ]; then
+    cp "$SYSCTL_CONF_FILE" "$memory_network_tmp" || { rm -f "$memory_network_tmp"; return 1; }
+  else
+    printf '# Generated by Mihomo Lite - low-memory socket budget\n' > "$memory_network_tmp"
+  fi
+  memory_network_applied=0
+  for memory_network_key in net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_max net.core.wmem_max; do
+    memory_network_old="$(sysctl -n "$memory_network_key" 2>/dev/null || true)"
+    [ -n "$memory_network_old" ] || continue
+    memory_network_new="$(cap_socket_memory_value "$memory_network_old" "$memory_socket_cap")" || continue
+    memory_network_normalized="$(printf '%s\n' "$memory_network_old" | awk '{$1=$1; print}')"
+    if [ "$memory_network_new" = "$memory_network_normalized" ]; then
+      if awk -v key="$memory_network_key" '$1 == key {found=1} END {exit !found}' "$memory_network_tmp"; then
+        printf '%s = %s\n' "$memory_network_key" "$memory_network_new" >> "$memory_network_tmp"
+        memory_network_applied=$((memory_network_applied + 1))
+      fi
+      continue
+    fi
+    if apply_sysctl_value "$memory_network_key" "$memory_network_new" "$memory_network_tmp"; then
+      memory_network_applied=$((memory_network_applied + 1))
+    else
+      ui_warn "$memory_network_key 仍未受控；Go 参数不能替代内核缓冲预算，请复测 OOM 增量。"
+    fi
+  done
+  if [ "$memory_network_applied" -gt 0 ]; then
+    # Keep only the last verified value for each managed socket key, removing
+    # obsolete large entries that could otherwise trigger legacy migration.
+    awk '
+      /^net\.(ipv4\.tcp_[rw]mem|core\.[rw]mem_max)[[:space:]]*=/ {
+        if (NR == FNR) last[$1] = FNR;
+        else if (last[$1] == FNR) print;
+        next;
+      }
+      NR != FNR {print}
+    ' "$memory_network_tmp" "$memory_network_tmp" > "$memory_network_tmp.clean" || return 1
+    mv "$memory_network_tmp.clean" "$memory_network_tmp" || return 1
+    mkdir -p "$(dirname "$SYSCTL_CONF_FILE")"
+    mv "$memory_network_tmp" "$SYSCTL_CONF_FILE" || return 1
+    chmod 644 "$SYSCTL_CONF_FILE"
+    ui_success "已应用/保存 $memory_network_applied 项网络缓冲预算，单项上限 $((memory_socket_cap / 1048576))MiB；修改前原值可通过菜单 55 恢复。"
+    ui_warn "这是小内存稳定性预算；高延迟线路的单连接峰值速度可能降低，不代表总内存已被硬限制。"
+  else
+    rm -f "$memory_network_tmp"
+  fi
 }
 
 apply_sysctl_value() {
@@ -4925,9 +5039,21 @@ migrate_legacy_sysctl_config() {
   if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = "bbr" ]; then
     printf 'net.ipv4.tcp_congestion_control = bbr\n' >> "$legacy_sysctl_tmp"
   fi
+  legacy_socket_cap="$(low_memory_socket_cap)"
+  if [ "$legacy_socket_cap" -gt 0 ]; then
+    for legacy_socket_key in net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_max net.core.wmem_max; do
+      awk -v key="$legacy_socket_key" '$1 == key {found=1} END {exit !found}' "$SYSCTL_CONF_FILE" || continue
+      legacy_socket_value="$(sysctl -n "$legacy_socket_key" 2>/dev/null | awk '{$1=$1; print}')"
+      legacy_socket_safe="$(cap_socket_memory_value "$legacy_socket_value" "$legacy_socket_cap")" || continue
+      if [ "$legacy_socket_value" = "$legacy_socket_safe" ]; then
+        printf '%s = %s\n' "$legacy_socket_key" "$legacy_socket_safe" >> "$legacy_sysctl_tmp"
+      fi
+    done
+  fi
   mv "$legacy_sysctl_tmp" "$SYSCTL_CONF_FILE"
   chmod 644 "$SYSCTL_CONF_FILE"
-  ui_success "已清理旧版激进 sysctl 持久化配置；当前运行参数未被更改。"
+  apply_low_memory_network_budget || return 1
+  ui_warn "已清理旧版大连接队列配置；小内存机器会同时收紧可写的网络缓冲。内存未知或大于 512MiB 时，请使用菜单 55 恢复原参数。"
 }
 
 network_metric_value() {
@@ -5096,6 +5222,12 @@ optimize_sysctl_network() {
 
   tmp_file="$(make_temp /tmp/mihomo-sysctl.XXXXXX)"
   printf '# Generated by Mihomo Lite - conservative verified settings\n' > "$tmp_file"
+  # Keep an existing socket budget when refreshing BBR settings. The live
+  # values may already be capped, so a later comparison alone cannot recreate
+  # the persistence that would otherwise be lost here.
+  if [ -f "$SYSCTL_CONF_FILE" ]; then
+    awk '/^net\.(ipv4\.tcp_[rw]mem|core\.[rw]mem_max)[[:space:]]*=/' "$SYSCTL_CONF_FILE" >> "$tmp_file"
+  fi
   applied=0
 
   case " $network_available " in
@@ -5130,6 +5262,7 @@ optimize_sysctl_network() {
     rm -f "$tmp_file"
     ui_warn "当前参数已尝试应用，但无法保存到 $SYSCTL_CONF_FILE。"
   fi
+  apply_low_memory_network_budget
 }
 
 ipv6_settings_menu() {
@@ -5308,9 +5441,9 @@ cloudflared_memory_limit() {
     ''|*[!0-9]*) printf '96MiB' ;;
     *)
       if [ "$cf_memory_mib" -le 192 ]; then
-        printf '48MiB'
+        printf '40MiB'
       elif [ "$cf_memory_mib" -le 256 ]; then
-        printf '64MiB'
+        printf '40MiB'
       elif [ "$cf_memory_mib" -le 512 ]; then
         printf '96MiB'
       else
@@ -5329,7 +5462,7 @@ set -eu
 TOKEN_FILE="$CLOUDFLARED_TOKEN_FILE"
 [ -s "\$TOKEN_FILE" ] || { echo "Cloudflare Tunnel Token 不存在" >&2; exit 1; }
 export GOMEMLIMIT="$cf_go_memory"
-export GOGC="125"
+export GOGC="75"
 export GODEBUG="madvdontneed=1"
 exec "$CLOUDFLARED_BIN" tunnel --no-autoupdate --protocol http2 --metrics "$CLOUDFLARED_METRICS" run --token-file "$CLOUDFLARED_TOKEN_FILE"
 EOF
@@ -5544,7 +5677,7 @@ tunnel_diagnostics() {
       tail -n 20 "$LOG_DIR/${SERVICE_NAME}.err" "$LOG_DIR/${SERVICE_NAME}.log" "$CLOUDFLARED_LOG" 2>/dev/null || true
       ;;
   esac
-  ui_warn "若 oom/oom_kill 增长，说明多线程测速超过容器内存承载能力；优先使用菜单 44 的省资源稳连模式并降低测速线程数。"
+  ui_warn "若本次测试的 oom/oom_kill 计数增长，说明发生了内存压力；单线程也可能触发。检查 memory.stat 的 anon/sock/kernel，使用 mh memory-safe 后复测，必要时限制速率。"
 }
 
 tunnel_watchdog_cron_line() {
@@ -6406,6 +6539,7 @@ case "${1:-}" in
   rename|rename-all|33) rename_all_nodes ;;
   perf|performance|tune|44) performance_tuning_menu ;;
   apply-runtime|runtime-apply) apply_saved_runtime_service ;;
+  memory-safe|oom-safe) apply_memory_safe_runtime ;;
   sysctl|netopt|55) network_optimization_menu ;;
   netopt-apply|network-apply) optimize_sysctl_network ;;
   network-migrate|net-migrate) need_root; migrate_legacy_sysctl_config ;;
